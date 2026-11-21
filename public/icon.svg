@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" fill="none">
+  <circle cx="256" cy="256" r="250" fill="#FFFFFF"/>
+  <circle cx="256" cy="256" r="240" stroke="#F95700" stroke-width="11"/>
+  <circle cx="256" cy="256" r="220" stroke="#F95700" stroke-width="4.5"/>
+
+  <!-- Inner framing arc behind cross -->
+  <path d="M 142 308 A 126 126 0 1 1 370 308" stroke="#F95700" stroke-width="4" stroke-linecap="round"/>
+
+  <!-- Arched NETANYA lettering positioned deterministically around radius 176 -->
+  <g fill="#F95700" font-family="Arial Black, Inter, sans-serif" font-weight="900" font-size="52" text-anchor="middle">
+    <text transform="translate(115, 150) rotate(-52)">N</text>
+    <text transform="translate(152, 113) rotate(-35)">E</text>
+    <text transform="translate(199, 90) rotate(-18)">T</text>
+    <text transform="translate(256, 80) rotate(0)">A</text>
+    <text transform="translate(313, 90) rotate(18)">N</text>
+    <text transform="translate(360, 113) rotate(35)">Y</text>
+    <text transform="translate(397, 150) rotate(52)">A</text>
+  </g>
+
+  <!-- Outer Orange Pharmacy Cross -->
+  <path d="M222 126C222 121.582 225.582 118 230 118H282C286.418 118 290 121.582 290 126V172H336C340.418 172 344 175.582 344 180V232C344 236.418 340.418 240 336 240H290V286C290 290.418 286.418 294 282 294H230C225.582 294 222 290.418 222 286V240H176C171.582 240 168 236.418 168 232V180C168 175.582 171.582 172 176 172H222V126Z" fill="#F95700"/>
+
+  <!-- Inner White Cross Outline -->
+  <path d="M229 130C229 127.791 230.791 126 233 126H279C281.209 126 283 127.791 283 130V179H332C334.209 179 336 180.791 336 183V229C336 231.209 334.209 233 332 233H283V282C283 284.209 281.209 286 279 286H233C230.791 286 229 284.209 229 282V233H180C177.791 233 176 231.209 176 229V183C176 180.791 177.791 179 180 179H229V130Z" stroke="#FFFFFF" stroke-width="4" fill="none"/>
+
+  <!-- White Star of David inside cross centered at (256, 206) -->
+  <polygon points="256,170 287,224 225,224" stroke="#FFFFFF" stroke-width="5.5" stroke-linejoin="round" fill="none"/>
+  <polygon points="256,242 287,188 225,188" stroke="#FFFFFF" stroke-width="5.5" stroke-linejoin="round" fill="none"/>
+
+  <!-- PHARMACY Wordmark -->
+  <text x="256" y="344" fill="#F95700" font-family="Arial Black, Inter, sans-serif" font-weight="900" font-size="52" letter-spacing="3" text-anchor="middle">PHARMACY</text>
+
+  <!-- Horizontal Rule -->
+  <line x1="96" y1="358" x2="416" y2="358" stroke="#F95700" stroke-width="4" stroke-linecap="round"/>
+
+  <!-- Tagline -->
+  <text x="256" y="388" fill="#F95700" font-family="Georgia, Times New Roman, serif" font-style="italic" font-weight="700" font-size="25" text-anchor="middle">Your Health is Our</text>
+  <text x="256" y="418" fill="#F95700" font-family="Georgia, Times New Roman, serif" font-style="italic" font-weight="700" font-size="25" text-anchor="middle">Number One Priority</text>
+</svg>
