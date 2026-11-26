@@ -1,10 +1,11 @@
-import React, { useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState } from 'react';
 import {
   ArrowRight,
   CheckCircle2,
   CreditCard,
   ExternalLink,
   Info,
+  Menu,
   Minus,
   PackageCheck,
   Plus,
@@ -18,16 +19,17 @@ import {
   INVENTORY_CATEGORIES,
   type AuthUser,
   type InventoryCategory,
-  type InventoryItem,
   type OtcOrder,
   type PharmacyService,
+  type PublicInventoryItem,
 } from '../types.ts';
+import { faqGroups } from '../data/faqs.ts';
 import { apiFetch, formatMoney } from '../utils/api.ts';
 import { NetanyaLogo } from './NetanyaLogo.tsx';
 import { PWAInstallButton } from './PWAControls.tsx';
 
 interface PublicStorefrontProps {
-  items: InventoryItem[];
+  items: PublicInventoryItem[];
   services: PharmacyService[];
   acceptedPlans: Array<{
     id: string;
@@ -44,11 +46,57 @@ interface PublicStorefrontProps {
 }
 
 interface CartEntry {
-  item: InventoryItem;
+  item: PublicInventoryItem;
   quantity: number;
 }
 
-const HERO_IMG = '/src/assets/images/hero_pharmacy_dispensary_1794919114919.jpg';
+type StorefrontPage = 'home' | 'shop' | 'services' | 'insurance' | 'faqs';
+
+const getStorefrontPage = (): StorefrontPage => {
+  switch (window.location.pathname.replace(/\/+$/, '') || '/') {
+    case '/shop':
+      return 'shop';
+    case '/services':
+      return 'services';
+    case '/insurance':
+      return 'insurance';
+    case '/faqs':
+      return 'faqs';
+    default:
+      return 'home';
+  }
+};
+
+const HERO_IMG = '/src/assets/images/netanya_pharmacy.png';
+const SITE_URL = 'https://netanyapharmacy.com';
+
+const pageMetadata: Record<StorefrontPage, { title: string; description: string }> = {
+  home: {
+    title: 'Netanya Pharmacy & Retail Shop | Afienya, Ghana',
+    description:
+      'Visit Netanya Pharmacy & Retail Shop at Afienya ECG Under Bridge, Ghana. Shop medicines and health products, and find pharmacy services and opening hours.',
+  },
+  shop: {
+    title: 'Shop Medicines & Health Products | Netanya Pharmacy',
+    description:
+      'Shop medicines and health products from Netanya Pharmacy & Retail Shop in Afienya, Ghana, with convenient pickup or delivery.',
+  },
+  services: {
+    title: 'Pharmacy Services in Afienya | Netanya Pharmacy',
+    description:
+      'Explore walk-in pharmacy tests and services at Netanya Pharmacy & Retail Shop, Afienya ECG Under Bridge, Ghana.',
+  },
+  insurance: {
+    title: 'Accepted Health Insurance | Netanya Pharmacy Afienya',
+    description:
+      'See health insurance schemes accepted at Netanya Pharmacy & Retail Shop in Afienya, Ghana.',
+  },
+  faqs: {
+    title: 'Health & Medicine FAQs | Netanya Pharmacy Afienya, Ghana',
+    description:
+      'General health and medicine FAQs from Netanya Pharmacy in Afienya, Ghana, covering malaria, fever, pain relief, antibiotics, coughs, diarrhea, and medicine safety.',
+  },
+};
 
 export const PublicStorefront: React.FC<PublicStorefrontProps> = ({
   items,
@@ -66,7 +114,56 @@ export const PublicStorefront: React.FC<PublicStorefrontProps> = ({
   const [cartOpen, setCartOpen] = useState(false);
   const [heroImgFailed, setHeroImgFailed] = useState(false);
   const [brokenImages, setBrokenImages] = useState<Record<string, boolean>>({});
-  const [selectedInfoItem, setSelectedInfoItem] = useState<InventoryItem | null>(null);
+  const [selectedInfoItem, setSelectedInfoItem] = useState<PublicInventoryItem | null>(null);
+  const [page, setPage] = useState<StorefrontPage>(getStorefrontPage);
+  const [mobileNavOpen, setMobileNavOpen] = useState(false);
+  const [headerScrolled, setHeaderScrolled] = useState(false);
+
+  useEffect(() => {
+    const metadata = pageMetadata[page];
+    const canonicalUrl = `${SITE_URL}${window.location.pathname.replace(/\/+$/, '') || '/'}`;
+
+    document.title = metadata.title;
+    document.querySelector('meta[name="description"]')?.setAttribute('content', metadata.description);
+    document.querySelector('meta[property="og:title"]')?.setAttribute('content', metadata.title);
+    document
+      .querySelector('meta[property="og:description"]')
+      ?.setAttribute('content', metadata.description);
+    document.querySelector('meta[property="og:url"]')?.setAttribute('content', canonicalUrl);
+    document.querySelector('meta[name="twitter:title"]')?.setAttribute('content', metadata.title);
+    document
+      .querySelector('meta[name="twitter:description"]')
+      ?.setAttribute('content', metadata.description);
+    document.querySelector('link[rel="canonical"]')?.setAttribute('href', canonicalUrl);
+  }, [page]);
+
+  useEffect(() => {
+    const onScroll = () => setHeaderScrolled(window.scrollY > 8);
+    onScroll();
+    window.addEventListener('scroll', onScroll, { passive: true });
+    return () => window.removeEventListener('scroll', onScroll);
+  }, []);
+
+  const navigateToPage = (path: string) => {
+    window.history.pushState({}, '', path);
+    setPage(getStorefrontPage());
+    setMobileNavOpen(false);
+    window.scrollTo(0, 0);
+  };
+
+  const handlePageLink = (event: React.MouseEvent<HTMLAnchorElement>) => {
+    if (
+      event.button !== 0 ||
+      event.metaKey ||
+      event.ctrlKey ||
+      event.shiftKey ||
+      event.altKey
+    ) {
+      return;
+    }
+    event.preventDefault();
+    navigateToPage(event.currentTarget.pathname);
+  };
 
   // Checkout state
   const [customerName, setCustomerName] = useState(user?.displayName || '');
@@ -76,6 +173,62 @@ export const PublicStorefront: React.FC<PublicStorefrontProps> = ({
   const [checkoutBusy, setCheckoutBusy] = useState(false);
   const [checkoutError, setCheckoutError] = useState<string | null>(null);
   const [confirmedOrder, setConfirmedOrder] = useState<OtcOrder | null>(null);
+
+  useEffect(() => {
+    const handlePopState = () => {
+      setPage(getStorefrontPage());
+      window.scrollTo(0, 0);
+    };
+    window.addEventListener('popstate', handlePopState);
+    return () => window.removeEventListener('popstate', handlePopState);
+  }, []);
+
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const reference = params.get('reference') || params.get('trxref');
+    if (!reference) return;
+
+    const rawPending = sessionStorage.getItem('netanya_pending_retail_checkout');
+    if (!rawPending) {
+      setCheckoutError('Payment returned, but the checkout details could not be recovered.');
+      return;
+    }
+
+    let pending: {
+      customerName: string;
+      customerEmail: string;
+      fulfillmentType: 'pickup' | 'delivery';
+      shippingAddress: string;
+      items: Array<{ inventoryId: string; quantity: number }>;
+    };
+    try {
+      pending = JSON.parse(rawPending);
+    } catch {
+      setCheckoutError('Payment returned, but the checkout details could not be recovered.');
+      return;
+    }
+
+    setCheckoutBusy(true);
+    setCheckoutError(null);
+    setCartOpen(true);
+    apiFetch<{ order: OtcOrder }>('/api/public/orders', {
+      method: 'POST',
+      body: JSON.stringify({ ...pending, paymentReference: reference }),
+    })
+      .then((res) => {
+        setConfirmedOrder(res.order);
+        setCart([]);
+        sessionStorage.removeItem('netanya_pending_retail_checkout');
+        onOrderCompleted();
+        const url = new URL(window.location.href);
+        url.searchParams.delete('reference');
+        window.history.replaceState({}, '', `${url.pathname}${url.search}${url.hash}`);
+      })
+      .catch((err) => {
+        setCheckoutError(err instanceof Error ? err.message : 'Payment verification failed.');
+      })
+      .finally(() => setCheckoutBusy(false));
+  }, [onOrderCompleted]);
 
   const availableCategories = useMemo(
     () => INVENTORY_CATEGORIES.filter((cat) => items.some((i) => i.category === cat)),
@@ -121,13 +274,13 @@ export const PublicStorefront: React.FC<PublicStorefrontProps> = ({
   const taxCents = Math.round(subtotalCents * 0.15);
   const totalCents = subtotalCents + taxCents;
 
-  const addToCart = (item: InventoryItem) => {
-    if (item.stockQuantity <= 0) return;
+  const addToCart = (item: PublicInventoryItem) => {
+    if (!item.inStock) return;
     setConfirmedOrder(null);
     setCart((prev) => {
       const existing = prev.find((e) => e.item.id === item.id);
       if (existing) {
-        const nextQty = Math.min(item.stockQuantity, existing.quantity + 1);
+        const nextQty = Math.min(50, existing.quantity + 1);
         return prev.map((e) => (e.item.id === item.id ? { ...e, quantity: nextQty } : e));
       }
       return [...prev, { item, quantity: 1 }];
@@ -140,7 +293,8 @@ export const PublicStorefront: React.FC<PublicStorefrontProps> = ({
       prev
         .map((entry) => {
           if (entry.item.id !== id) return entry;
-          const next = Math.min(entry.item.stockQuantity, entry.quantity + delta);
+          if (delta > 0 && !entry.item.inStock) return entry;
+          const next = Math.min(50, entry.quantity + delta);
           return next <= 0 ? null : { ...entry, quantity: next };
         })
         .filter((x): x is CartEntry => x !== null)
@@ -153,21 +307,33 @@ export const PublicStorefront: React.FC<PublicStorefrontProps> = ({
     setCheckoutBusy(true);
     setCheckoutError(null);
     try {
-      const res = await apiFetch<{ order: OtcOrder }>('/api/public/orders', {
+      const pendingCheckout = {
+        customerName: customerName || user?.displayName || '',
+        customerEmail: customerEmail || user?.email || '',
+        fulfillmentType,
+        shippingAddress,
+        items: cart.map((c) => ({ inventoryId: c.item.id, quantity: c.quantity })),
+      };
+      sessionStorage.setItem(
+        'netanya_pending_retail_checkout',
+        JSON.stringify(pendingCheckout)
+      );
+
+      const res = await apiFetch<{ authorization_url: string }>(
+        '/api/public/payments/initialize',
+        {
         method: 'POST',
-        body: JSON.stringify({
-          customerName: customerName || user?.displayName,
-          customerEmail: customerEmail || user?.email,
-          fulfillmentType,
-          shippingAddress,
-          items: cart.map((c) => ({ inventoryId: c.item.id, quantity: c.quantity })),
-        }),
-      });
-      setConfirmedOrder(res.order);
-      setCart([]);
-      onOrderCompleted();
+          body: JSON.stringify({
+            customerEmail: pendingCheckout.customerEmail,
+            items: pendingCheckout.items,
+            callbackUrl: `${window.location.origin}${window.location.pathname}`,
+          }),
+        }
+      );
+      window.location.assign(res.authorization_url);
     } catch (err) {
-      setCheckoutError(err instanceof Error ? err.message : 'Unable to place order.');
+      setCheckoutError(err instanceof Error ? err.message : 'Unable to start payment.');
+      sessionStorage.removeItem('netanya_pending_retail_checkout');
     } finally {
       setCheckoutBusy(false);
     }
@@ -175,52 +341,82 @@ export const PublicStorefront: React.FC<PublicStorefrontProps> = ({
 
   return (
     <div className="min-h-screen bg-white text-slate-900">
-      {/* 3-Zone Top Bar Contract */}
-      <header className="sticky top-0 z-30 border-b border-slate-200 bg-white/95 backdrop-blur-xs">
-        <div className="mx-auto flex max-w-7xl items-center justify-between gap-8 px-4 py-4 sm:px-6 lg:px-8">
-          {/* Zone 1: Brand Title */}
+      {/* Global site header */}
+      <header
+        className={`sticky top-0 z-40 border-b bg-white/90 backdrop-blur transition-shadow duration-300 ${
+          headerScrolled ? 'border-slate-200 shadow-md shadow-slate-900/5' : 'border-transparent'
+        }`}
+      >
+        <div className="mx-auto flex h-16 max-w-7xl items-center justify-between gap-3 px-4 sm:px-6 lg:px-8">
+          {/* Brand */}
           <a
-            href="#top"
-            className="inline-flex items-center gap-2.5 font-display text-base font-bold tracking-tight text-slate-900 whitespace-nowrap shrink-0 sm:text-lg"
+            href="/"
+            onClick={handlePageLink}
+            className="flex min-w-0 items-center gap-2.5"
+            aria-label="Netanya Pharmacy & Retail Shop — home"
           >
-            <NetanyaLogo size={36} />
-            <span>
-              NETANYA PHARMACY <span className="text-orange-600">&amp; RETAIL SHOP</span>
+            <NetanyaLogo size={44} className="h-11 w-11" />
+            <span className="flex min-w-0 flex-col leading-none">
+              <span className="font-display text-base font-bold tracking-tight text-slate-900 sm:text-lg">
+                NETANYA PHARMACY
+              </span>
+              <span className="mt-1 text-[10px] font-semibold uppercase tracking-[0.14em] text-orange-600 sm:text-[11px]">
+                &amp; Retail Shop
+              </span>
             </span>
           </a>
 
-          {/* Zone 2: 3 Single-line Nav Links */}
+          {/* Desktop nav */}
           <nav
             aria-label="Primary"
-            className="hidden lg:flex items-center gap-7 text-sm font-medium text-slate-600"
+            className="hidden items-center gap-1 lg:flex"
           >
-            <a
-              href="#retail-shop"
-              className="hover:text-orange-600 hover:underline underline-offset-4 transition-colors whitespace-nowrap shrink-0"
-            >
-              Shop
-            </a>
-            <a
-              href="#clinical-services"
-              className="hover:text-orange-600 hover:underline underline-offset-4 transition-colors whitespace-nowrap shrink-0"
-            >
-              Services
-            </a>
-            <a
-              href="#insurance"
-              className="hover:text-orange-600 hover:underline underline-offset-4 transition-colors whitespace-nowrap shrink-0"
-            >
-              Insurance
-            </a>
+            {(
+              [
+                ['/', 'Home', 'home'],
+                ['/shop', 'Shop', 'shop'],
+                ['/services', 'Services', 'services'],
+                ['/insurance', 'Insurance', 'insurance'],
+                ['/faqs', 'FAQs', 'faqs'],
+              ] as const
+            ).map(([href, label, key]) => (
+              <a
+                key={key}
+                href={href}
+                onClick={handlePageLink}
+                aria-current={page === key ? 'page' : undefined}
+                className={`rounded-lg px-3 py-2 text-sm font-semibold transition-colors whitespace-nowrap ${
+                  page === key
+                    ? 'bg-orange-50 text-orange-700'
+                    : 'text-slate-600 hover:bg-slate-50 hover:text-slate-900'
+                }`}
+              >
+                {label}
+              </a>
+            ))}
           </nav>
 
-          {/* Zone 3: 1 Primary Action */}
-          <div className="flex items-center shrink-0">
+          {/* Actions */}
+          <div className="flex items-center gap-2 shrink-0">
+            <button
+              type="button"
+              onClick={() => setCartOpen(true)}
+              aria-label={`Open bag, ${totalBagCount} item${totalBagCount === 1 ? '' : 's'}`}
+              className="relative inline-flex items-center gap-1.5 rounded-lg border border-slate-200 px-3 py-2 text-xs font-semibold text-slate-700 hover:border-orange-400 hover:text-orange-700 transition-colors min-h-[40px]"
+            >
+              <ShoppingBag className="h-4 w-4 text-orange-600" />
+              <span className="hidden sm:inline">Bag</span>
+              {totalBagCount > 0 && (
+                <span className="absolute -right-1.5 -top-1.5 flex h-5 min-w-5 items-center justify-center rounded-full bg-orange-600 px-1 font-mono text-[10px] font-bold tabular-nums text-white">
+                  {totalBagCount}
+                </span>
+              )}
+            </button>
             {user ? (
               <button
                 type="button"
                 onClick={onEnterPortal}
-                className="rounded-lg bg-orange-600 px-4 py-2 text-xs font-semibold text-white hover:bg-orange-700 transition-colors whitespace-nowrap shrink-0 min-h-[40px]"
+                className="rounded-lg bg-orange-600 px-4 py-2 text-xs font-semibold text-white hover:bg-orange-700 transition-colors whitespace-nowrap min-h-[40px]"
               >
                 My Account
               </button>
@@ -228,34 +424,152 @@ export const PublicStorefront: React.FC<PublicStorefrontProps> = ({
               <button
                 type="button"
                 onClick={onOpenAuth}
-                className="rounded-lg bg-orange-600 px-4 py-2 text-xs font-semibold text-white hover:bg-orange-700 transition-colors whitespace-nowrap shrink-0 min-h-[40px]"
+                className="rounded-lg bg-orange-600 px-4 py-2 text-xs font-semibold text-white hover:bg-orange-700 transition-colors whitespace-nowrap min-h-[40px]"
               >
                 Sign In
               </button>
             )}
+            <button
+              type="button"
+              onClick={() => setMobileNavOpen((v) => !v)}
+              aria-label={mobileNavOpen ? 'Close menu' : 'Open menu'}
+              aria-expanded={mobileNavOpen}
+              className="inline-flex h-10 w-10 items-center justify-center rounded-lg border border-slate-200 text-slate-700 hover:border-orange-400 lg:hidden"
+            >
+              {mobileNavOpen ? <X className="h-5 w-5" /> : <Menu className="h-5 w-5" />}
+            </button>
           </div>
         </div>
+
+        {/* Mobile nav panel */}
+        {mobileNavOpen && (
+          <nav
+            aria-label="Mobile primary"
+            className="border-t border-slate-100 bg-white px-4 pb-4 pt-2 lg:hidden"
+          >
+            <div className="flex flex-col gap-1">
+              {(
+                [
+                  ['/', 'Home', 'home'],
+                  ['/shop', 'Shop', 'shop'],
+                  ['/services', 'Services', 'services'],
+                  ['/insurance', 'Insurance', 'insurance'],
+                  ['/faqs', 'FAQs', 'faqs'],
+                ] as const
+              ).map(([href, label, key]) => (
+                <a
+                  key={key}
+                  href={href}
+                  onClick={handlePageLink}
+                  aria-current={page === key ? 'page' : undefined}
+                  className={`rounded-lg px-3 py-2.5 text-sm font-semibold ${
+                    page === key
+                      ? 'bg-orange-50 text-orange-700'
+                      : 'text-slate-600 hover:bg-slate-50'
+                  }`}
+                >
+                  {label}
+                </a>
+              ))}
+              <button
+                type="button"
+                onClick={() => {
+                  setMobileNavOpen(false);
+                  setCartOpen(true);
+                }}
+                className="flex items-center gap-2 rounded-lg px-3 py-2.5 text-sm font-semibold text-slate-600 hover:bg-slate-50"
+              >
+                <ShoppingBag className="h-4 w-4 text-orange-600" />
+                Bag{totalBagCount > 0 ? ` (${totalBagCount})` : ''}
+              </button>
+            </div>
+          </nav>
+        )}
       </header>
 
       <main id="top">
-        {/* Hero Split */}
-        <section className="border-b border-slate-200 bg-white">
-          <div className="mx-auto max-w-7xl px-4 py-12 sm:px-6 lg:px-8 lg:py-16">
+        {page === 'home' && (
+        <section key="home" className="relative overflow-hidden border-b border-slate-200 bg-white">
+          {/* Decorative pharmacy motif layer */}
+          <div aria-hidden="true" className="pointer-events-none absolute inset-0 hidden lg:block">
+            {/* Capsule */}
+            <svg
+              viewBox="0 0 64 32"
+              className="absolute left-[4%] top-[16%] h-9 w-18 animate-float text-orange-200"
+            >
+              <rect x="1" y="1" width="62" height="30" rx="15" fill="currentColor" />
+              <path d="M32 1v30" stroke="white" strokeWidth="2" />
+              <rect x="1" y="1" width="31" height="30" rx="15" fill="white" opacity="0.65" />
+            </svg>
+            {/* Medical cross */}
+            <svg
+              viewBox="0 0 48 48"
+              className="absolute right-[6%] top-[12%] h-11 w-11 animate-float-slow text-orange-300"
+            >
+              <circle cx="24" cy="24" r="22" fill="currentColor" opacity="0.25" />
+              <path
+                d="M20 12h8v8h8v8h-8v8h-8v-8h-8v-8h8z"
+                fill="currentColor"
+              />
+            </svg>
+            {/* Heartbeat */}
+            <svg
+              viewBox="0 0 48 48"
+              className="absolute bottom-[22%] left-[10%] h-10 w-10 animate-heartbeat text-orange-400"
+            >
+              <path
+                d="M24 8c-6 0-10 4-10 9 0 5 4 7 6 10s4 8 4 13h0c0-5 2-10 4-13s6-5 6-10c0-5-4-9-10-9z"
+                fill="currentColor"
+                opacity="0.5"
+              />
+            </svg>
+            {/* EKG vitals strip */}
+            <svg
+              className="absolute inset-x-0 bottom-0 h-14 w-full text-orange-500/70"
+              preserveAspectRatio="none"
+              viewBox="0 0 1200 56"
+              aria-hidden="true"
+            >
+              <path
+                d="M0 34 H220 L240 34 252 12 264 48 276 34 H420 L440 34 452 12 464 48 476 34 H620 L640 34 652 12 664 48 676 34 H820 L840 34 852 12 864 48 876 34 H1020 L1040 34 1052 12 1064 48 1076 34 H1200"
+                fill="none"
+                stroke="currentColor"
+                strokeWidth="2.5"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                pathLength="100"
+                strokeDasharray="14 86"
+                className="animate-ekg"
+              />
+            </svg>
+          </div>
+
+          <div className="relative mx-auto max-w-7xl px-4 py-12 sm:px-6 lg:px-8 lg:py-16">
             <div className="grid grid-cols-1 items-stretch gap-10 lg:grid-cols-12">
               <div className="flex flex-col justify-between lg:col-span-6">
                 <div>
-                  <h1 className="font-display text-3xl font-bold tracking-tight text-slate-900 sm:text-5xl [text-wrap:balance] leading-[1.1]">
+                  <h1
+                    className="animate-fade-up font-display text-3xl font-bold tracking-tight text-slate-900 sm:text-5xl [text-wrap:balance] leading-[1.1]"
+                    style={{ animationDelay: '40ms' }}
+                  >
                     Your Health is Our Number One Priority.
                   </h1>
-                  <p className="mt-4 max-w-lg text-base leading-relaxed text-slate-600">
+                  <p
+                    className="animate-fade-up mt-4 max-w-lg text-base leading-relaxed text-slate-600"
+                    style={{ animationDelay: '120ms' }}
+                  >
                     Shop medicines and wellness items for pickup or delivery, manage prescriptions,
                     and message our pharmacists anytime.
                   </p>
                 </div>
 
-                <div className="mt-8 flex flex-wrap items-center gap-4">
+                <div
+                  className="animate-fade-up mt-8 flex flex-wrap items-center gap-4"
+                  style={{ animationDelay: '200ms' }}
+                >
                   <a
-                    href="#retail-shop"
+                    href="/shop"
+                    onClick={handlePageLink}
                     className="inline-flex items-center gap-2 rounded-lg bg-orange-600 px-5 py-3 text-sm font-semibold text-white hover:bg-orange-700 transition-colors min-h-[44px]"
                   >
                     Shop Now
@@ -272,8 +586,8 @@ export const PublicStorefront: React.FC<PublicStorefrontProps> = ({
                 </div>
               </div>
 
-              <div className="lg:col-span-6">
-                <div className="h-full min-h-[300px] overflow-hidden rounded-2xl border border-slate-200 bg-slate-50">
+              <div className="animate-fade-up lg:col-span-6" style={{ animationDelay: '240ms' }}>
+                <div className="h-full min-h-[300px] overflow-hidden rounded-2xl border border-slate-200 bg-slate-50 shadow-sm">
                   {!heroImgFailed ? (
                     <img
                       src={HERO_IMG}
@@ -295,9 +609,11 @@ export const PublicStorefront: React.FC<PublicStorefrontProps> = ({
             </div>
           </div>
         </section>
+        )}
 
         {/* Retail Shop Section */}
-        <section id="retail-shop" className="border-b border-slate-200 bg-slate-50/60 py-14">
+        {page === 'shop' && (
+        <section key="shop" className="animate-fade-up border-b border-slate-200 bg-slate-50/60 py-14">
           <div className="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8">
             <div className="flex flex-col gap-4 md:flex-row md:items-end md:justify-between">
               <div>
@@ -399,13 +715,13 @@ export const PublicStorefront: React.FC<PublicStorefrontProps> = ({
                       </span>
                     </div>
                     <div className="grid grid-cols-1 gap-5 sm:grid-cols-2 lg:grid-cols-4">
-                      {section.items.map((item) => {
-                        const isLow = item.stockQuantity <= item.reorderThreshold;
-                        const outOfStock = item.stockQuantity <= 0;
+                      {section.items.map((item, idx) => {
+                        const outOfStock = !item.inStock;
                         return (
                           <article
                             key={item.id}
-                            className="group flex flex-col justify-between rounded-xl border border-slate-200 bg-white p-4 transition-transform duration-150 hover:-translate-y-0.5"
+                            className="group animate-fade-up flex flex-col justify-between rounded-xl border border-slate-200 bg-white p-4 shadow-sm transition-all duration-150 hover:-translate-y-0.5 hover:shadow-md"
+                            style={{ animationDelay: `${Math.min(idx, 8) * 45}ms` }}
                           >
                             <div>
                               <button
@@ -464,14 +780,12 @@ export const PublicStorefront: React.FC<PublicStorefrontProps> = ({
                                   className={`text-[11px] font-medium tabular-nums ${
                                     outOfStock
                                       ? 'text-red-600'
-                                      : isLow
-                                        ? 'text-amber-700'
-                                        : 'text-emerald-700'
+                                      : 'text-emerald-700'
                                   }`}
                                 >
                                   {outOfStock
                                     ? 'Out of stock'
-                                    : `${item.stockQuantity} in stock`}
+                                    : 'In stock'}
                                 </div>
                               </div>
 
@@ -504,11 +818,14 @@ export const PublicStorefront: React.FC<PublicStorefrontProps> = ({
             )}
           </div>
         </section>
+        )}
 
         {/* Walk-In Pharmacy Services & Accepted Insurance */}
-        <section id="clinical-services" className="border-b border-slate-200 bg-white py-14">
+        {(page === 'services' || page === 'insurance') && (
+        <section key={page} className="animate-fade-up border-b border-slate-200 bg-white py-14">
           <div className="mx-auto max-w-7xl px-4 sm:px-6 lg:px-8">
-            <div className="grid grid-cols-1 gap-10 lg:grid-cols-12 items-start">
+            <div className={`grid grid-cols-1 gap-10 items-start ${page === 'insurance' ? 'lg:grid-cols-1' : 'lg:grid-cols-12'}`}>
+              {page !== 'insurance' && (
               <div className="lg:col-span-7">
                 <div className="flex items-end justify-between gap-4">
                   <div>
@@ -546,9 +863,11 @@ export const PublicStorefront: React.FC<PublicStorefrontProps> = ({
                   ))}
                 </div>
               </div>
+              )}
 
               {/* Insurance Network Coverage */}
-              <div id="insurance" className="lg:col-span-5">
+              {page !== 'services' && (
+              <div className={page === 'insurance' ? 'lg:col-span-1' : 'lg:col-span-5'}>
                 <div className="rounded-xl border border-slate-200 bg-slate-50/70 p-6">
                   <div className="flex items-center justify-between">
                     <h3 className="font-display text-lg font-bold text-slate-900">
@@ -589,21 +908,87 @@ export const PublicStorefront: React.FC<PublicStorefrontProps> = ({
                   </div>
                 </div>
               </div>
+              )}
             </div>
           </div>
         </section>
+        )}
+
+        {page === 'faqs' && (
+          <section className="animate-fade-up border-b border-slate-200 bg-white py-14">
+            <div className="mx-auto max-w-4xl px-4 sm:px-6 lg:px-8">
+              <header className="mb-10">
+                <h1 className="font-display text-3xl font-bold text-slate-900 sm:text-4xl">
+                  Health &amp; Medicine FAQs
+                </h1>
+                <p className="mt-3 max-w-2xl text-sm leading-relaxed text-slate-600">
+                  General information about malaria, fever, common medicines, infections, and
+                  pharmacy care. This page cannot diagnose illness or recommend a treatment for
+                  your individual situation. Linked references may not describe Ghanaian care
+                  protocols. Ask a qualified local health professional for advice, and seek
+                  urgent care for severe symptoms.
+                </p>
+              </header>
+
+              <div className="space-y-10">
+                {faqGroups.map((group, index) => (
+                  <section key={group.title} aria-labelledby={`faq-group-${index}`}>
+                    <h2
+                      id={`faq-group-${index}`}
+                      className="mb-4 font-display text-xl font-bold text-slate-900"
+                    >
+                      {group.title}
+                    </h2>
+                    <div className="space-y-3">
+                      {group.items.map((faq) => (
+                        <details
+                          key={faq.question}
+                          className="group rounded-xl border border-slate-200 bg-slate-50/50 p-4 open:bg-white"
+                        >
+                          <summary className="cursor-pointer font-semibold text-slate-800 marker:text-orange-600">
+                            {faq.question}
+                          </summary>
+                          <p className="mt-3 text-sm leading-relaxed text-slate-600">
+                            {faq.answer}
+                          </p>
+                        </details>
+                      ))}
+                    </div>
+                    {group.sources && (
+                      <p className="mt-4 text-xs leading-relaxed text-slate-500">
+                        Trusted reading:{' '}
+                        {group.sources.map((source, sourceIndex) => (
+                          <React.Fragment key={source.url}>
+                            {sourceIndex > 0 && ' · '}
+                            <a
+                              className="font-medium text-orange-700 underline underline-offset-2 hover:text-orange-800"
+                              href={source.url}
+                              target="_blank"
+                              rel="noreferrer"
+                            >
+                              {source.label}
+                            </a>
+                          </React.Fragment>
+                        ))}
+                      </p>
+                    )}
+                  </section>
+                ))}
+              </div>
+            </div>
+          </section>
+        )}
       </main>
 
-      <footer className="border-t border-slate-200 bg-slate-50 py-8">
+      <footer className="animate-fade-in border-t border-slate-200 bg-slate-50 py-8">
         <div className="mx-auto flex max-w-7xl flex-col items-start justify-between gap-4 px-4 sm:flex-row sm:items-center sm:px-6 lg:px-8">
           <div>
-            <p className="font-display text-sm font-bold text-slate-900">
-              NETANYA PHARMACY &amp; RETAIL SHOP
-            </p>
-            <p className="mt-0.5 text-xs text-slate-500">Accra, Ghana</p>
+            <address className="mt-0.5 text-xs not-italic text-slate-500">
+              <p>Afienya ECG Under Bridge, Ghana</p>
+              <p>Mon–Sat: 7:30 am–9:00 pm · Sun: 9:00 am–9:00 pm</p>
+            </address>
           </div>
           <div className="flex items-center gap-4">
-            <PWAInstallButton variant="compact" />
             <span className="text-xs text-slate-500">© 2026 Netanya Pharmacy</span>
           </div>
         </div>
@@ -611,9 +996,9 @@ export const PublicStorefront: React.FC<PublicStorefrontProps> = ({
 
       {/* Slide-Over Cart & Retail Checkout Drawer */}
       {cartOpen && (
-        <div className="fixed inset-0 z-50 flex justify-end bg-slate-900/40 backdrop-blur-xs">
+        <div className="fixed inset-0 z-50 flex justify-end bg-slate-900/40 backdrop-blur-xs animate-overlay-in">
           <div
-            className="flex h-full w-full max-w-md flex-col bg-white shadow-2xl"
+            className="flex h-full w-full max-w-md flex-col bg-white shadow-2xl animate-drawer-in"
             role="dialog"
             aria-modal="true"
             aria-label="Retail shopping bag"
@@ -808,7 +1193,7 @@ export const PublicStorefront: React.FC<PublicStorefrontProps> = ({
                   disabled={checkoutBusy}
                   className="mt-4 w-full rounded-lg bg-orange-600 py-3 text-sm font-semibold text-white hover:bg-orange-700 disabled:opacity-50 transition-colors"
                 >
-                  {checkoutBusy ? 'Processing Order...' : 'Complete Retail Order'}
+                  {checkoutBusy ? 'Processing Payment...' : 'Pay for Retail Order'}
                 </button>
               </div>
             )}
@@ -857,7 +1242,7 @@ export const PublicStorefront: React.FC<PublicStorefrontProps> = ({
                   <div>
                     <div className="font-semibold text-slate-500">Manufacturer</div>
                     <div className="text-sm font-semibold text-slate-900">
-                      {selectedInfoItem.manufacturerName || selectedInfoItem.supplierName}
+                      {selectedInfoItem.manufacturerName || 'Not listed'}
                     </div>
                   </div>
 
@@ -880,12 +1265,6 @@ export const PublicStorefront: React.FC<PublicStorefrontProps> = ({
                       <div className="font-semibold text-slate-500">Product Code</div>
                       <div className="font-mono text-slate-900 tabular-nums">
                         {selectedInfoItem.ndcCode}
-                      </div>
-                    </div>
-                    <div>
-                      <div className="font-semibold text-slate-500">Expiry</div>
-                      <div className="font-mono text-slate-900 tabular-nums">
-                        {selectedInfoItem.expiryDate}
                       </div>
                     </div>
                     <div>
@@ -951,14 +1330,14 @@ export const PublicStorefront: React.FC<PublicStorefrontProps> = ({
                   </button>
                   <button
                     type="button"
-                    disabled={selectedInfoItem.stockQuantity <= 0}
+                    disabled={!selectedInfoItem.inStock}
                     onClick={() => {
                       addToCart(selectedInfoItem);
                       setSelectedInfoItem(null);
                     }}
                     className="rounded-lg bg-orange-600 px-4 py-2 text-xs font-semibold text-white hover:bg-orange-700 disabled:bg-slate-200 disabled:text-slate-500"
                   >
-                    {selectedInfoItem.stockQuantity <= 0 ? 'Out of stock' : 'Add to Bag'}
+                    {!selectedInfoItem.inStock ? 'Out of stock' : 'Add to Bag'}
                   </button>
                 </div>
               </div>

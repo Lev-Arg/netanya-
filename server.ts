@@ -5,7 +5,7 @@ import path from 'node:path';
 import dotenv from 'dotenv';
 import express, { type NextFunction, type Request, type Response } from 'express';
 import { WebSocket, WebSocketServer } from 'ws';
-import { adjudicateClaim } from './server/claimEngine.ts';
+import { adjudicateClaim, type AdjudicationInput } from './server/claimEngine.ts';
 import { db, initializeDatabase, nextSequence } from './server/db.ts';
 import {
   decryptPHI,
@@ -27,6 +27,7 @@ import {
   type OtcOrderItem,
   type PatientPHI,
   type PharmacyService,
+  type PublicInventoryItem,
   type PrescriptionStatus,
   type ReplenishmentStatus,
   type ServiceLog,
@@ -58,10 +59,29 @@ interface AuthedSocket {
 
 const clients = new Set<AuthedSocket>();
 
+function getCurrentSession(token: string): SessionPayload | null {
+  const session = verifySessionToken(token);
+  if (!session) return null;
+
+  const account = db
+    .prepare('SELECT role, email, display_name FROM users WHERE id = ?')
+    .get(session.uid) as
+    | { role: UserRole; email: string; display_name: string }
+    | undefined;
+  if (!account || account.role !== session.role) return null;
+
+  return {
+    ...session,
+    role: account.role,
+    email: account.email,
+    displayName: account.display_name,
+  };
+}
+
 wss.on('connection', (ws, req) => {
   const url = new URL(req.url || '/ws', 'http://localhost');
   const token = url.searchParams.get('token') || '';
-  const user = token ? verifySessionToken(token) : null;
+  const user = getCurrentSession(token);
   const client: AuthedSocket = { ws, user };
   clients.add(client);
 
@@ -77,7 +97,7 @@ wss.on('connection', (ws, req) => {
     try {
       const msg = JSON.parse(String(raw)) as { type?: string; token?: string };
       if (msg.type === 'auth' && typeof msg.token === 'string') {
-        client.user = verifySessionToken(msg.token);
+        client.user = getCurrentSession(msg.token);
       }
     } catch {
       // Ignore malformed client frames
@@ -93,7 +113,17 @@ function broadcastTopics(topics: string[], targetUserId?: string): void {
   const payload = JSON.stringify({ type: 'sync', topics, timestamp: Date.now() });
   for (const client of clients) {
     if (client.ws.readyState !== WebSocket.OPEN) continue;
-    if (targetUserId && client.user && client.user.role === 'patient' && client.user.uid !== targetUserId) {
+    if (client.user) {
+      const account = db
+        .prepare('SELECT role FROM users WHERE id = ?')
+        .get(client.user.uid) as { role: UserRole } | undefined;
+      if (!account || account.role !== client.user.role) {
+        client.ws.close(1008, 'Session is no longer valid.');
+        clients.delete(client);
+        continue;
+      }
+    }
+    if (targetUserId && client.user?.uid !== targetUserId) {
       continue;
     }
     client.ws.send(payload);
@@ -109,6 +139,107 @@ function runTx<T>(fn: () => T): T {
   } catch (err) {
     db.exec('ROLLBACK;');
     throw err;
+  }
+}
+
+function validateConfirmedQuantity(quantity: unknown, requestedQuantity: unknown): number {
+  const confirmed = Number(quantity);
+  const requested = Number(requestedQuantity);
+  if (
+    !Number.isSafeInteger(requested) ||
+    requested < 1 ||
+    !Number.isSafeInteger(confirmed) ||
+    confirmed < 1 ||
+    confirmed > requested
+  ) {
+    throw new Error('Confirmed quantity must be a positive whole number no greater than the quantity ordered.');
+  }
+  return confirmed;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function isFormularyTier(value: unknown): value is AdjudicationInput['formularyTier'] {
+  return value === 1 || value === 2 || value === 3;
+}
+
+function isDawCode(value: unknown): value is AdjudicationInput['dawCode'] {
+  return value === '0' || value === '1' || value === '2';
+}
+
+interface PaystackPayment {
+  reference: string;
+  amountCents: number;
+}
+
+interface PaystackTransaction {
+  reference: string;
+  status: string;
+  amountCents: number;
+  currency: string;
+}
+
+async function fetchPaystackTransaction(reference: string): Promise<PaystackTransaction> {
+  const secret = process.env.PAYSTACK_SECRET_KEY?.trim();
+  if (!secret) {
+    throw new Error('Online payment is not configured.');
+  }
+  if (!reference) {
+    throw new Error('A successful payment reference is required.');
+  }
+
+  const response = await fetch(
+    `https://api.paystack.co/transaction/verify/${encodeURIComponent(reference)}`,
+    {
+      headers: { Authorization: `Bearer ${secret}` },
+      signal: AbortSignal.timeout(10_000),
+    }
+  );
+  const payload = await response.json() as {
+    status?: boolean;
+    message?: string;
+    data?: { status?: string; amount?: number; currency?: string; reference?: string };
+  };
+  if (!response.ok || !payload.status || !payload.data) {
+    throw new Error(payload.message || 'Payment verification failed.');
+  }
+  const payment = payload.data;
+  if (payment.reference !== reference || typeof payment.amount !== 'number') {
+    throw new Error('Payment verification failed.');
+  }
+  return {
+    reference,
+    status: String(payment.status || ''),
+    amountCents: Number(payment.amount),
+    currency: String(payment.currency || ''),
+  };
+}
+
+async function fetchPaystackPayment(reference: string): Promise<PaystackPayment> {
+  const payment = await fetchPaystackTransaction(reference);
+  if (payment.status !== 'success' || payment.currency !== 'GHS') {
+    throw new Error('Payment was not successful or does not match the order total.');
+  }
+  return { reference: payment.reference, amountCents: payment.amountCents };
+}
+
+async function verifyPaystackPayment(reference: string, expectedAmountCents?: number): Promise<void> {
+  const payment = await fetchPaystackPayment(reference);
+  if (expectedAmountCents !== undefined && payment.amountCents !== expectedAmountCents) {
+    throw new Error('Payment was not successful or does not match the order total.');
+  }
+}
+
+// Only absolute https URLs are safe to render as links in the public storefront.
+function sanitizeHttpsUrl(value: unknown): string | null {
+  if (typeof value !== 'string' || !value.trim()) return null;
+  try {
+    const url = new URL(value.trim());
+    return url.protocol === 'https:' ? url.toString() : null;
+  } catch {
+    return null;
   }
 }
 
@@ -216,6 +347,42 @@ function mapInventoryRow(row: Record<string, unknown>): InventoryItem {
   };
 }
 
+function mapPublicInventoryRow(row: Record<string, unknown>): PublicInventoryItem {
+  return {
+    id: String(row.id),
+    ndcCode: String(row.ndc_code),
+    name: String(row.name),
+    category: row.category as InventoryCategory,
+    description: String(row.description),
+    imageUrl: row.image_url ? String(row.image_url) : null,
+    manufacturerName: row.manufacturer_name ? String(row.manufacturer_name) : '',
+    activeIngredient: row.active_ingredient ? String(row.active_ingredient) : '',
+    dosageForm: row.dosage_form ? String(row.dosage_form) : '',
+    usageDirections: row.usage_directions ? String(row.usage_directions) : '',
+    warnings: row.warnings ? String(row.warnings) : '',
+    storageInfo: row.storage_info ? String(row.storage_info) : '',
+    officialSourceUrl: row.official_source_url ? String(row.official_source_url) : null,
+    unitPriceCents: Number(row.unit_price_cents),
+    inStock: Number(row.stock_quantity) > 0,
+  };
+}
+
+function getDispensingClaim(rx: Record<string, unknown>): Record<string, unknown> | undefined {
+  if (rx.status === 'dispensed') {
+    throw new Error(`${String(rx.rx_number)} is already dispensed.`);
+  }
+  if (rx.status !== 'ready') {
+    throw new Error(`${String(rx.rx_number)} must be verified and marked ready before dispensing.`);
+  }
+  const claim = db
+    .prepare('SELECT * FROM insurance_claims WHERE prescription_id = ?')
+    .get(String(rx.id)) as Record<string, unknown> | undefined;
+  if (claim && claim.claim_status !== 'adjudicated' && claim.claim_status !== 'paid') {
+    throw new Error(`${String(rx.rx_number)} has no approved insurance claim.`);
+  }
+  return claim;
+}
+
 function mapServiceRow(row: Record<string, unknown>): PharmacyService {
   return {
     id: String(row.id),
@@ -298,6 +465,7 @@ function recordCashDrawerEvent(params: {
 
 interface AuthedRequest extends Request {
   user?: SessionPayload;
+  params: Record<string, string>;
 }
 
 app.use(express.json({ limit: '1mb' }));
@@ -322,12 +490,44 @@ app.use('/api/owner', (_req, res, next) => {
   next();
 });
 
+// Fixed-window in-memory rate limiter for unauthenticated surfaces.
+const rateBuckets = new Map<string, { count: number; resetAt: number }>();
+function rateLimit(name: string, maxRequests: number, windowMs: number) {
+  return (req: Request, res: Response, next: NextFunction): void => {
+    const now = Date.now();
+    if (rateBuckets.size > 10000) {
+      for (const [k, b] of rateBuckets) {
+        if (b.resetAt <= now) rateBuckets.delete(k);
+      }
+    }
+    const key = `${name}|${req.ip || 'unknown'}`;
+    const bucket = rateBuckets.get(key);
+    if (!bucket || bucket.resetAt <= now) {
+      rateBuckets.set(key, { count: 1, resetAt: now + windowMs });
+      next();
+      return;
+    }
+    if (bucket.count >= maxRequests) {
+      res.status(429).json({ error: 'Too many requests. Please try again later.' });
+      return;
+    }
+    bucket.count += 1;
+    next();
+  };
+}
+
+app.use('/api/public/payments/initialize', rateLimit('pay-init', 10, 60_000));
+app.use('/api/public/orders', rateLimit('public-orders', 20, 60_000));
+app.use('/api/public', rateLimit('public', 60, 60_000));
+app.use('/api/auth/login', rateLimit('auth-login', 10, 60_000));
+app.use('/api/auth/register', rateLimit('auth-register', 10, 60_000));
+
 function requireAuth(req: AuthedRequest, res: Response, next: NextFunction): void {
   const header = req.headers.authorization || '';
   const token = header.startsWith('Bearer ') ? header.slice(7).trim() : '';
-  const session = verifySessionToken(token);
+  const session = getCurrentSession(token);
   if (!session) {
-    res.status(401).json({ error: 'Authentication required. Please sign in.' });
+    res.status(401).json({ error: 'Session is no longer valid. Please sign in again.' });
     return;
   }
   req.user = session;
@@ -358,7 +558,12 @@ app.get('/api/health', (_req, res) => {
 // Public catalog (no PHI)
 app.get('/api/public/catalog', (_req, res) => {
   const rows = db
-    .prepare('SELECT * FROM inventory WHERE requires_prescription = 0 ORDER BY category, name')
+    .prepare(
+      `SELECT id, ndc_code, name, category, description, image_url, manufacturer_name,
+        active_ingredient, dosage_form, usage_directions, warnings, storage_info,
+        official_source_url, unit_price_cents, stock_quantity
+       FROM inventory WHERE requires_prescription = 0 ORDER BY category, name`
+    )
     .all() as Record<string, unknown>[];
   const plans = db
     .prepare('SELECT id, payer_name, bin, pcn, group_prefix FROM insurance_plans ORDER BY payer_name')
@@ -367,7 +572,7 @@ app.get('/api/public/catalog', (_req, res) => {
     .prepare('SELECT * FROM pharmacy_services WHERE active = 1 ORDER BY category, name')
     .all() as Record<string, unknown>[];
   res.json({
-    items: rows.map(mapInventoryRow),
+    items: rows.map(mapPublicInventoryRow),
     services: serviceRows.map(mapServiceRow),
     acceptedPlans: plans.map((p) => ({
       id: String(p.id),
@@ -379,14 +584,93 @@ app.get('/api/public/catalog', (_req, res) => {
   });
 });
 
+// Public / Patient OTC payment initialization
+app.post('/api/public/payments/initialize', async (req: AuthedRequest, res) => {
+  const { customerEmail, items, callbackUrl } = req.body as {
+    customerEmail?: string;
+    items?: Array<{ inventoryId: string; quantity: number }>;
+    callbackUrl?: string;
+  };
+
+  if (!customerEmail || !Array.isArray(items) || items.length === 0) {
+    res.status(400).json({ error: 'Receipt email and at least one retail item are required.' });
+    return;
+  }
+
+  try {
+    let subtotalCents = 0;
+    for (const reqItem of items) {
+      const qty = Math.max(1, Math.min(20, Math.floor(Number(reqItem.quantity) || 1)));
+      const invRow = db
+        .prepare('SELECT * FROM inventory WHERE id = ? AND requires_prescription = 0')
+        .get(reqItem.inventoryId) as Record<string, unknown> | undefined;
+      if (!invRow) throw new Error('One or more items are unavailable.');
+      if (Number(invRow.stock_quantity) < qty) {
+        throw new Error(`Insufficient stock for ${String(invRow.name)}.`);
+      }
+      subtotalCents += Number(invRow.unit_price_cents) * qty;
+    }
+    const totalCents = subtotalCents + Math.round(subtotalCents * 0.15);
+    const secret = process.env.PAYSTACK_SECRET_KEY?.trim();
+    if (!secret) {
+      res.status(503).json({ error: 'Online payment is not configured.' });
+      return;
+    }
+    if (typeof callbackUrl !== 'string') {
+      res.status(400).json({ error: 'A valid payment callback URL is required.' });
+      return;
+    }
+
+    const callback = new URL(callbackUrl);
+    const requestHost = req.headers.host;
+    if (
+      (callback.protocol !== 'http:' && callback.protocol !== 'https:') ||
+      !requestHost ||
+      callback.host !== requestHost
+    ) {
+      res.status(400).json({ error: 'A valid payment callback URL is required.' });
+      return;
+    }
+
+    const response = await fetch('https://api.paystack.co/transaction/initialize', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${secret}`,
+        'Content-Type': 'application/json',
+      },
+      signal: AbortSignal.timeout(10_000),
+      body: JSON.stringify({
+        email: customerEmail.trim(),
+        amount: totalCents,
+        currency: 'GHS',
+        callback_url: callback.toString(),
+        metadata: { source: 'netanya-public-storefront', totalCents },
+      }),
+    });
+    const payload = await response.json() as {
+      status?: boolean;
+      message?: string;
+      data?: { authorization_url?: string; access_code?: string; reference?: string };
+    };
+    if (!response.ok || !payload.status || !payload.data?.authorization_url) {
+      res.status(502).json({ error: payload.message || 'Unable to start payment.' });
+      return;
+    }
+    res.json(payload.data);
+  } catch (err) {
+    res.status(400).json({ error: err instanceof Error ? err.message : 'Unable to start payment.' });
+  }
+});
+
 // Public / Patient OTC Retail Checkout
-app.post('/api/public/orders', (req: AuthedRequest, res) => {
-  const { customerName, customerEmail, fulfillmentType, shippingAddress, items } = req.body as {
+app.post('/api/public/orders', async (req: AuthedRequest, res) => {
+  const { customerName, customerEmail, fulfillmentType, shippingAddress, items, paymentReference } = req.body as {
     customerName?: string;
     customerEmail?: string;
     fulfillmentType?: 'pickup' | 'delivery';
     shippingAddress?: string;
     items?: Array<{ inventoryId: string; quantity: number }>;
+    paymentReference?: string;
   };
 
   if (!customerName || !customerEmail || !Array.isArray(items) || items.length === 0) {
@@ -398,6 +682,23 @@ app.post('/api/public/orders', (req: AuthedRequest, res) => {
   const session = header.startsWith('Bearer ') ? verifySessionToken(header.slice(7).trim()) : null;
 
   try {
+    let preflightSubtotalCents = 0;
+    for (const reqItem of items) {
+      const qty = Math.max(1, Math.min(20, Math.floor(Number(reqItem.quantity) || 1)));
+      const invRow = db
+        .prepare('SELECT * FROM inventory WHERE id = ? AND requires_prescription = 0')
+        .get(reqItem.inventoryId) as Record<string, unknown> | undefined;
+      if (!invRow) throw new Error('One or more items are unavailable for checkout.');
+      if (Number(invRow.stock_quantity) < qty) {
+        throw new Error(`Insufficient stock for ${String(invRow.name)}.`);
+      }
+      preflightSubtotalCents += Number(invRow.unit_price_cents) * qty;
+    }
+    await verifyPaystackPayment(
+      String(paymentReference || ''),
+      preflightSubtotalCents + Math.round(preflightSubtotalCents * 0.15)
+    );
+
     const result = runTx(() => {
       const resolvedItems: OtcOrderItem[] = [];
       let subtotalCents = 0;
@@ -449,12 +750,28 @@ app.post('/api/public/orders', (req: AuthedRequest, res) => {
       const orderId = `otc_${crypto.randomUUID().slice(0, 8)}`;
       const orderNumber = `ORD-${nextSequence('ord_seq', 77102)}`;
       const now = new Date().toISOString();
+      const existingPayment = db
+        .prepare('SELECT id FROM otc_orders WHERE payment_reference = ?')
+        .get(String(paymentReference)) as { id: string } | undefined;
+      if (existingPayment) {
+        throw new Error('This payment has already been used for an order.');
+      }
+      const claimedPayment = db
+        .prepare('SELECT reference FROM payment_references WHERE reference = ?')
+        .get(String(paymentReference));
+      if (claimedPayment) {
+        throw new Error('This payment has already been used for an order.');
+      }
+      db.prepare(
+        'INSERT INTO payment_references (reference, amount_cents, created_at) VALUES (?, ?, ?)'
+      ).run(String(paymentReference), totalCents, now);
 
       db.prepare(
         `INSERT INTO otc_orders (
           id, order_number, customer_name, customer_email, fulfillment_type, shipping_address,
-          items_json, subtotal_cents, tax_cents, total_cents, status, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          items_json, subtotal_cents, tax_cents, total_cents, status, payment_reference,
+          payment_method, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'paystack', ?)`
       ).run(
         orderId,
         orderNumber,
@@ -469,6 +786,7 @@ app.post('/api/public/orders', (req: AuthedRequest, res) => {
         taxCents,
         totalCents,
         fulfillmentType === 'delivery' ? 'confirmed' : 'ready_for_pickup',
+        String(paymentReference),
         now
       );
 
@@ -1663,7 +1981,7 @@ app.post('/api/staff/inventory', requireAuth, requireRole('pharmacist', 'owner')
         (usageDirections || '').trim(),
         (warnings || '').trim(),
         (storageInfo || '').trim(),
-        officialSourceUrl ? String(officialSourceUrl).trim() : null,
+        sanitizeHttpsUrl(officialSourceUrl),
         Math.max(100, Number(unitPriceCents) || 2500),
         Math.max(50, Number(costPriceCents) || 1000),
         stock,
@@ -1922,7 +2240,261 @@ app.patch('/api/staff/orders/:id/status', requireAuth, requireRole('pharmacist',
   res.json({ ok: true });
 });
 
-app.post('/api/staff/pos/checkout', requireAuth, requireRole('pharmacist', 'owner'), (req: AuthedRequest, res) => {
+// Read-only mirror of the /api/staff/pos/checkout totals. MUST stay in sync with
+// that handler: the MoMo charge amount is later verified against checkout's
+// grandTotalCents, so any divergence fails closed at checkout.
+function computePosQuote(params: {
+  otcItems?: Array<{ inventoryId: string; quantity: number }>;
+  prescriptionIds?: string[];
+  serviceItems?: Array<{ serviceId: string; quantity: number }>;
+  discountPercent?: number;
+}): { grandTotalCents: number; breakdown: Record<string, number> } {
+  const safeOtcItems = Array.isArray(params.otcItems) ? params.otcItems : [];
+  const safeRxIds = Array.isArray(params.prescriptionIds) ? params.prescriptionIds : [];
+  const safeServiceItems = Array.isArray(params.serviceItems) ? params.serviceItems : [];
+  const discountPct = Math.max(0, Math.min(25, Number(params.discountPercent) || 0));
+
+  let otcSubtotalCents = 0;
+  for (const reqItem of safeOtcItems) {
+    const qty = Math.max(1, Math.min(50, Math.floor(Number(reqItem.quantity) || 1)));
+    const invRow = db
+      .prepare('SELECT * FROM inventory WHERE id = ? AND requires_prescription = 0')
+      .get(reqItem.inventoryId) as Record<string, unknown> | undefined;
+    if (!invRow) {
+      throw new Error('Counter shelf item not found.');
+    }
+    const currentStock = Number(invRow.stock_quantity);
+    if (currentStock < qty) {
+      throw new Error(`Insufficient stock for ${String(invRow.name)} (${currentStock} left).`);
+    }
+    otcSubtotalCents += Number(invRow.unit_price_cents) * qty;
+  }
+
+  const discountCents = Math.round(otcSubtotalCents * (discountPct / 100));
+  const discountedOtcSubtotal = Math.max(0, otcSubtotalCents - discountCents);
+  const taxCents = Math.round(discountedOtcSubtotal * 0.15);
+  const otcTotalCents = discountedOtcSubtotal + taxCents;
+
+  let rxCopayTotalCents = 0;
+  for (const rxId of safeRxIds) {
+    const rx = db
+      .prepare('SELECT * FROM prescriptions WHERE id = ?')
+      .get(rxId) as Record<string, unknown> | undefined;
+    if (!rx) {
+      throw new Error('Selected prescription was not found.');
+    }
+    if (rx.status === 'dispensed') {
+      throw new Error(`${String(rx.rx_number)} is already dispensed.`);
+    }
+    const inv = db
+      .prepare('SELECT * FROM inventory WHERE id = ?')
+      .get(String(rx.inventory_id)) as Record<string, unknown> | undefined;
+    if (!inv || Number(inv.stock_quantity) < 1) {
+      throw new Error(`Cannot dispense ${String(rx.medication_name)}: out of stock.`);
+    }
+    const claim = db
+      .prepare('SELECT * FROM insurance_claims WHERE prescription_id = ?')
+      .get(rxId) as Record<string, unknown> | undefined;
+    rxCopayTotalCents +=
+      claim && (claim.claim_status === 'adjudicated' || claim.claim_status === 'paid')
+        ? Number(claim.patient_copay_cents)
+        : Number(rx.unit_price_cents);
+  }
+
+  let serviceTotalCents = 0;
+  for (const reqSrv of safeServiceItems) {
+    const qty = Math.max(1, Math.min(20, Math.floor(Number(reqSrv.quantity) || 1)));
+    const srvRow = db
+      .prepare('SELECT * FROM pharmacy_services WHERE id = ? AND active = 1')
+      .get(reqSrv.serviceId) as Record<string, unknown> | undefined;
+    if (!srvRow) {
+      throw new Error('Selected pharmacy service was not found or is paused.');
+    }
+    serviceTotalCents += Number(srvRow.price_cents) * qty;
+  }
+
+  const grandTotalCents = otcTotalCents + rxCopayTotalCents + serviceTotalCents;
+  return {
+    grandTotalCents,
+    breakdown: { otcTotalCents, rxCopayTotalCents, serviceTotalCents },
+  };
+}
+
+const MOMO_PROVIDERS = new Set(['mtn', 'atl', 'vod']);
+
+// Staff-initiated MoMo charge: sends a USSD prompt to the customer's phone for the
+// server-computed bill total. The customer must approve within ~180s; staff then
+// poll the status endpoint and complete checkout with the returned reference.
+app.post(
+  '/api/staff/pos/payment-requests',
+  requireAuth,
+  requireRole('pharmacist', 'owner'),
+  async (req: AuthedRequest, res) => {
+    const {
+      customerPhone,
+      momoProvider,
+      customerEmail,
+      discountPercent,
+      otcItems,
+      prescriptionIds,
+      serviceItems,
+    } = req.body as {
+      customerPhone?: string;
+      momoProvider?: string;
+      customerEmail?: string;
+      discountPercent?: number;
+      otcItems?: Array<{ inventoryId: string; quantity: number }>;
+      prescriptionIds?: string[];
+      serviceItems?: Array<{ serviceId: string; quantity: number }>;
+    };
+
+    const phone = String(customerPhone || '').replace(/[\s-]/g, '');
+    const provider = String(momoProvider || '').trim().toLowerCase();
+    if (!/^\+?\d{9,15}$/.test(phone)) {
+      res.status(400).json({ error: 'A valid customer MoMo phone number is required.' });
+      return;
+    }
+    if (!MOMO_PROVIDERS.has(provider)) {
+      res.status(400).json({ error: 'MoMo provider must be mtn, atl, or vod.' });
+      return;
+    }
+
+    let quote: { grandTotalCents: number; breakdown: Record<string, number> };
+    try {
+      quote = computePosQuote({ otcItems, prescriptionIds, serviceItems, discountPercent });
+    } catch (err) {
+      res.status(400).json({ error: err instanceof Error ? err.message : 'Unable to price this sale.' });
+      return;
+    }
+    if (quote.grandTotalCents <= 0) {
+      res.status(400).json({ error: 'Order total must be greater than zero.' });
+      return;
+    }
+
+    const secret = process.env.PAYSTACK_SECRET_KEY?.trim();
+    if (!secret) {
+      res.status(503).json({ error: 'Online payment is not configured.' });
+      return;
+    }
+
+    const reference = `pos_${crypto.randomUUID()}`;
+    try {
+      const response = await fetch('https://api.paystack.co/charge', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${secret}`,
+          'Content-Type': 'application/json',
+        },
+        signal: AbortSignal.timeout(15_000),
+        body: JSON.stringify({
+          email: (customerEmail || 'counter@netanyarx.local').trim() || 'counter@netanyarx.local',
+          amount: quote.grandTotalCents,
+          currency: 'GHS',
+          reference,
+          mobile_money: { phone, provider },
+        }),
+      });
+      const payload = await response.json() as {
+        status?: boolean;
+        message?: string;
+        data?: { status?: string; reference?: string; display_text?: string };
+      };
+      if (!response.ok || !payload.status || !payload.data) {
+        res.status(502).json({ error: payload.message || 'Unable to send payment prompt.' });
+        return;
+      }
+
+      const chargeStatus = String(payload.data.status || 'pending');
+      const storedStatus =
+        chargeStatus === 'success' ? 'success' : chargeStatus === 'failed' || chargeStatus === 'abandoned' ? 'failed' : 'pending';
+      const now = new Date().toISOString();
+      db.prepare(
+        `UPDATE pos_payment_requests SET status = 'superseded', resolved_at = ?
+         WHERE created_by = ? AND status = 'pending'`
+      ).run(now, req.user!.uid);
+      db.prepare(
+        `INSERT INTO pos_payment_requests (
+          reference, grand_total_cents, status, created_by, created_by_name, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?)`
+      ).run(
+        reference,
+        quote.grandTotalCents,
+        storedStatus,
+        req.user!.uid,
+        req.user!.displayName,
+        now
+      );
+
+      writeAuditLog(
+        req.user!.uid,
+        req.user!.displayName,
+        req.user!.role,
+        'POS_MOMO_CHARGE_INITIATED',
+        'pos_payment_requests',
+        reference,
+        `MoMo payment prompt sent via ${provider} for GH₵${(quote.grandTotalCents / 100).toFixed(2)}.`
+      );
+
+      res.status(201).json({
+        reference,
+        status: chargeStatus,
+        grandTotalCents: quote.grandTotalCents,
+        displayText: payload.data.display_text || null,
+      });
+    } catch (err) {
+      res.status(502).json({ error: err instanceof Error ? err.message : 'Unable to send payment prompt.' });
+    }
+  }
+);
+
+app.get(
+  '/api/staff/pos/payment-requests/:reference',
+  requireAuth,
+  requireRole('pharmacist', 'owner'),
+  async (req: AuthedRequest, res) => {
+    const row = db
+      .prepare('SELECT * FROM pos_payment_requests WHERE reference = ?')
+      .get(req.params.reference) as Record<string, unknown> | undefined;
+    if (!row) {
+      res.status(404).json({ error: 'Payment request not found.' });
+      return;
+    }
+
+    let status = String(row.status);
+    if (status === 'pending') {
+      const ageMs = Date.now() - new Date(String(row.created_at)).getTime();
+      if (ageMs > 10 * 60 * 1000) {
+        status = 'expired';
+      } else {
+        try {
+          const txn = await fetchPaystackTransaction(String(row.reference));
+          if (txn.status === 'success' && txn.currency === 'GHS' && txn.amountCents === Number(row.grand_total_cents)) {
+            status = 'success';
+          } else if (txn.status === 'failed' || txn.status === 'reversed') {
+            status = 'failed';
+          }
+        } catch {
+          // Paystack unreachable — report current stored status.
+        }
+      }
+      if (status !== String(row.status)) {
+        db.prepare('UPDATE pos_payment_requests SET status = ?, resolved_at = ? WHERE reference = ?').run(
+          status,
+          status === 'pending' ? null : new Date().toISOString(),
+          String(row.reference)
+        );
+      }
+    }
+
+    res.json({
+      reference: String(row.reference),
+      status,
+      grandTotalCents: Number(row.grand_total_cents),
+    });
+  }
+);
+
+app.post('/api/staff/pos/checkout', requireAuth, requireRole('pharmacist', 'owner'), async (req: AuthedRequest, res) => {
   const {
     customerName,
     customerEmail,
@@ -1933,6 +2505,7 @@ app.post('/api/staff/pos/checkout', requireAuth, requireRole('pharmacist', 'owne
     prescriptionIds,
     serviceItems,
     hardwareTransport,
+    paymentReference,
   } = req.body as {
     customerName?: string;
     customerEmail?: string;
@@ -1943,6 +2516,7 @@ app.post('/api/staff/pos/checkout', requireAuth, requireRole('pharmacist', 'owne
     prescriptionIds?: string[];
     serviceItems?: Array<{ serviceId: string; quantity: number }>;
     hardwareTransport?: string;
+    paymentReference?: string;
   };
 
   const safeOtcItems = Array.isArray(otcItems) ? otcItems : [];
@@ -1961,6 +2535,19 @@ app.post('/api/staff/pos/checkout', requireAuth, requireRole('pharmacist', 'owne
   const method =
     paymentMethod === 'cash' || paymentMethod === 'mobile_pay' ? paymentMethod : 'card';
   const discountPct = Math.max(0, Math.min(25, Number(discountPercent) || 0));
+
+  const paymentRef = String(paymentReference || '').trim();
+  let posPayment: PaystackPayment | null = null;
+  if (method !== 'cash') {
+    try {
+      posPayment = await fetchPaystackPayment(paymentRef);
+    } catch (err) {
+      res.status(402).json({
+        error: err instanceof Error ? err.message : 'A successful electronic payment is required.',
+      });
+      return;
+    }
+  }
 
   try {
     const result = runTx(() => {
@@ -2031,9 +2618,7 @@ app.post('/api/staff/pos/checkout', requireAuth, requireRole('pharmacist', 'owne
         if (!rx) {
           throw new Error('Selected prescription was not found.');
         }
-        if (rx.status === 'dispensed') {
-          throw new Error(`${String(rx.rx_number)} is already dispensed.`);
-        }
+        const claim = getDispensingClaim(rx);
 
         const inv = db
           .prepare('SELECT * FROM inventory WHERE id = ?')
@@ -2052,9 +2637,6 @@ app.post('/api/staff/pos/checkout', requireAuth, requireRole('pharmacist', 'owne
           `UPDATE prescriptions SET status = 'dispensed', next_refill_eligible_at = ?, updated_at = ? WHERE id = ?`
         ).run(nextRefillDate, now, rxId);
 
-        const claim = db
-          .prepare('SELECT * FROM insurance_claims WHERE prescription_id = ?')
-          .get(rxId) as Record<string, unknown> | undefined;
         let copayCents = Number(rx.unit_price_cents);
         if (claim && (claim.claim_status === 'adjudicated' || claim.claim_status === 'paid')) {
           copayCents = Number(claim.patient_copay_cents);
@@ -2132,17 +2714,35 @@ app.post('/api/staff/pos/checkout', requireAuth, requireRole('pharmacist', 'owne
       const grandTotalCents = otcTotalCents + rxCopayTotalCents + serviceTotalCents;
       const actualTenderedCents =
         method === 'cash'
-          ? Math.max(grandTotalCents, Number(tenderedCents) || grandTotalCents)
+          ? (Number(tenderedCents) || grandTotalCents)
           : grandTotalCents;
+      if (method === 'cash' && actualTenderedCents < grandTotalCents) {
+        throw new Error('Cash received is less than the total due.');
+      }
       const changeDueCents = method === 'cash' ? Math.max(0, actualTenderedCents - grandTotalCents) : 0;
+
+      if (method !== 'cash') {
+        if (posPayment!.amountCents !== grandTotalCents) {
+          throw new Error('Electronic payment amount does not match the order total.');
+        }
+        const claimedPayment = db
+          .prepare('SELECT reference FROM payment_references WHERE reference = ?')
+          .get(paymentRef);
+        if (claimedPayment) {
+          throw new Error('This payment has already been used for a sale.');
+        }
+        db.prepare(
+          'INSERT INTO payment_references (reference, amount_cents, created_at) VALUES (?, ?, ?)'
+        ).run(paymentRef, grandTotalCents, now);
+      }
 
       db.prepare(
         `INSERT INTO pos_transactions (
           id, receipt_number, cashier_id, cashier_name, customer_name, customer_email,
           payment_method, discount_percent, otc_lines_json, rx_lines_json, service_lines_json,
           subtotal_cents, discount_cents, tax_cents, rx_copay_total_cents, service_total_cents,
-          grand_total_cents, tendered_cents, change_due_cents, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          grand_total_cents, tendered_cents, change_due_cents, payment_reference, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       ).run(
         orderId,
         receiptNumber,
@@ -2163,6 +2763,7 @@ app.post('/api/staff/pos/checkout', requireAuth, requireRole('pharmacist', 'owne
         grandTotalCents,
         actualTenderedCents,
         changeDueCents,
+        method === 'cash' ? '' : paymentRef,
         now
       );
 
@@ -2390,6 +2991,10 @@ app.patch('/api/staff/prescriptions/:id/status', requireAuth, requireRole('pharm
     res.status(404).json({ error: 'Prescription not found.' });
     return;
   }
+  if (rx.status === 'dispensed' && status !== 'dispensed') {
+    res.status(400).json({ error: 'A dispensed prescription cannot be moved back to another status.' });
+    return;
+  }
 
   try {
     const result = runTx(() => {
@@ -2397,6 +3002,7 @@ app.patch('/api/staff/prescriptions/:id/status', requireAuth, requireRole('pharm
       let poTriggered = false;
 
       if (status === 'dispensed' && rx.status !== 'dispensed') {
+        getDispensingClaim(rx);
         const inv = db
           .prepare('SELECT * FROM inventory WHERE id = ?')
           .get(String(rx.inventory_id)) as Record<string, unknown> | undefined;
@@ -2639,46 +3245,112 @@ app.patch('/api/staff/inventory/:id', requireAuth, requireRole('pharmacist', 'ow
 });
 
 app.post('/api/staff/claims/adjudicate', requireAuth, requireRole('pharmacist', 'owner'), (req: AuthedRequest, res) => {
+  if (!isRecord(req.body)) {
+    res.status(400).json({ error: 'A valid claim request is required.' });
+    return;
+  }
+
   const {
     prescriptionId,
     planId,
-    bin,
-    pcn,
-    groupId,
     formularyTier,
     dawCode,
-    daysSupply,
-    deductibleRemainingCents,
     overrideCode,
     overrideNotes,
-  } = req.body as {
-    prescriptionId?: string;
-    planId?: string;
-    bin?: string;
-    pcn?: string;
-    groupId?: string;
-    formularyTier?: 1 | 2 | 3;
-    dawCode?: '0' | '1' | '2';
-    daysSupply?: number;
-    deductibleRemainingCents?: number;
-    overrideCode?: string;
-    overrideNotes?: string;
-  };
+  } = req.body;
 
-  if (!prescriptionId || !planId) {
+  if (
+    typeof prescriptionId !== 'string' ||
+    !prescriptionId.trim() ||
+    typeof planId !== 'string' ||
+    !planId.trim()
+  ) {
     res.status(400).json({ error: 'Prescription and insurance scheme are required.' });
+    return;
+  }
+  if (!isFormularyTier(formularyTier)) {
+    res.status(400).json({ error: 'Formulary tier must be 1, 2, or 3.' });
+    return;
+  }
+  if (!isDawCode(dawCode)) {
+    res.status(400).json({ error: 'DAW code must be 0, 1, or 2.' });
+    return;
+  }
+  if (
+    (overrideCode !== undefined && typeof overrideCode !== 'string') ||
+    (overrideNotes !== undefined && typeof overrideNotes !== 'string')
+  ) {
+    res.status(400).json({ error: 'Override code and pharmacist note must be text.' });
+    return;
+  }
+
+  const cleanPrescriptionId = prescriptionId.trim();
+  const cleanPlanId = planId.trim();
+  const cleanOverrideCode = (overrideCode || '').trim().toUpperCase();
+  const cleanOverrideNotes = (overrideNotes || '').trim();
+  if (cleanOverrideNotes.length > 500) {
+    res.status(400).json({ error: 'Pharmacist note must be 500 characters or fewer.' });
+    return;
+  }
+  if (Boolean(cleanOverrideCode) !== Boolean(cleanOverrideNotes)) {
+    res.status(400).json({ error: 'An override code and its pharmacist note must be provided together.' });
     return;
   }
 
   const rx = db
     .prepare('SELECT * FROM prescriptions WHERE id = ?')
-    .get(prescriptionId) as Record<string, unknown> | undefined;
+    .get(cleanPrescriptionId) as Record<string, unknown> | undefined;
   const planRow = db
     .prepare('SELECT * FROM insurance_plans WHERE id = ?')
-    .get(planId) as Record<string, unknown> | undefined;
+    .get(cleanPlanId) as Record<string, unknown> | undefined;
 
   if (!rx || !planRow) {
     res.status(404).json({ error: 'Prescription or insurance scheme not found.' });
+    return;
+  }
+
+  const phiRow = db
+    .prepare('SELECT encrypted_payload FROM patients_phi WHERE user_id = ?')
+    .get(String(rx.patient_id)) as { encrypted_payload: string } | undefined;
+  const patientInsurance = safeDecryptPHI(phiRow?.encrypted_payload);
+  if (!patientInsurance) {
+    res.status(409).json({ error: 'Patient insurance details are unavailable; update the profile before adjudication.' });
+    return;
+  }
+
+  const patientBin = typeof patientInsurance.bin === 'string' ? patientInsurance.bin.trim() : '';
+  const patientPcn = typeof patientInsurance.pcn === 'string' ? patientInsurance.pcn.trim() : '';
+  const groupId = typeof patientInsurance.groupNumber === 'string'
+    ? patientInsurance.groupNumber.trim()
+    : '';
+  const planBin = String(planRow.bin);
+  const planPcn = String(planRow.pcn);
+  if (patientBin !== planBin || patientPcn !== planPcn) {
+    res.status(409).json({ error: 'Selected scheme does not match the patient’s saved insurance details.' });
+    return;
+  }
+  const groupPrefix = String(planRow.group_prefix).trim();
+  if (!groupId) {
+    res.status(409).json({ error: 'Patient group details are missing; update the insurance profile before adjudication.' });
+    return;
+  }
+  if (!groupPrefix) {
+    res.status(409).json({ error: 'Selected scheme is missing group validation details.' });
+    return;
+  }
+  if (!groupId.toUpperCase().startsWith(groupPrefix.toUpperCase())) {
+    res.status(409).json({ error: 'Patient group details do not match the selected scheme.' });
+    return;
+  }
+
+  const supply = Number(rx.days_supply);
+  const unitPriceCents = Number(rx.unit_price_cents);
+  if (!Number.isSafeInteger(supply) || supply < 1 || supply > 180) {
+    res.status(409).json({ error: 'Prescription days supply is invalid; correct the prescription before adjudication.' });
+    return;
+  }
+  if (!Number.isSafeInteger(unitPriceCents) || unitPriceCents < 1) {
+    res.status(409).json({ error: 'Prescription price is invalid; correct the prescription before adjudication.' });
     return;
   }
 
@@ -2688,7 +3360,7 @@ app.post('/api/staff/claims/adjudicate', requireAuth, requireRole('pharmacist', 
        WHERE patient_id = ? AND inventory_id = ? AND id != ? AND status = 'dispensed'
        ORDER BY updated_at DESC LIMIT 1`
     )
-    .get(String(rx.patient_id), String(rx.inventory_id), prescriptionId) as
+    .get(String(rx.patient_id), String(rx.inventory_id), cleanPrescriptionId) as
     | { days_supply: number; updated_at: string }
     | undefined;
 
@@ -2705,8 +3377,8 @@ app.post('/api/staff/claims/adjudicate', requireAuth, requireRole('pharmacist', 
   const plan = {
     id: String(planRow.id),
     payerName: String(planRow.payer_name),
-    bin: bin?.trim() || String(planRow.bin),
-    pcn: pcn?.trim() || String(planRow.pcn),
+    bin: planBin,
+    pcn: planPcn,
     groupPrefix: String(planRow.group_prefix),
     tier1CopayCents: Number(planRow.tier1_copay_cents),
     tier2CopayCents: Number(planRow.tier2_copay_cents),
@@ -2714,27 +3386,42 @@ app.post('/api/staff/claims/adjudicate', requireAuth, requireRole('pharmacist', 
     reimbursementRate: Number(planRow.reimbursement_rate),
   };
 
-  const tier = formularyTier === 2 || formularyTier === 3 ? formularyTier : 1;
-  const daw = dawCode === '1' || dawCode === '2' ? dawCode : '0';
-  const supply = Math.max(1, Math.min(180, Number(daysSupply) || Number(rx.days_supply)));
-  const deductible = Math.max(0, Number(deductibleRemainingCents) || 0);
-
-  const adjudication = adjudicateClaim({
-    ucPriceCents: Number(rx.unit_price_cents),
+  const tier = formularyTier;
+  const daw = dawCode;
+  const adjudicationInput = {
+    ucPriceCents: unitPriceCents,
     daysSupply: supply,
     formularyTier: tier,
     dawCode: daw,
-    deductibleRemainingCents: deductible,
-    overrideCode: overrideCode || '',
+    deductibleRemainingCents: 0,
+    overrideCode: '',
     daysSinceLastFill,
     priorFillDaysSupply,
     plan,
+  };
+  const initialAdjudication = adjudicateClaim(adjudicationInput);
+  if (cleanOverrideCode) {
+    const matchesRejection =
+      (initialAdjudication.rejectionCode === '70' && cleanOverrideCode === 'SCC-02') ||
+      (initialAdjudication.rejectionCode === '75' &&
+        /^PA-[A-Z0-9]{4,20}$/.test(cleanOverrideCode)) ||
+      (initialAdjudication.rejectionCode === '79' &&
+        (cleanOverrideCode === '03' || cleanOverrideCode === '07')) ||
+      (initialAdjudication.rejectionCode === '88' && cleanOverrideCode === 'M0-1B');
+    if (!matchesRejection) {
+      res.status(400).json({ error: 'Override code is not valid for the current claim rejection.' });
+      return;
+    }
+  }
+  const adjudication = adjudicateClaim({
+    ...adjudicationInput,
+    overrideCode: cleanOverrideCode,
   });
 
   const now = new Date().toISOString();
   const existingClaim = db
     .prepare('SELECT id, claim_number FROM insurance_claims WHERE prescription_id = ?')
-    .get(prescriptionId) as { id: string; claim_number: string } | undefined;
+    .get(cleanPrescriptionId) as { id: string; claim_number: string } | undefined;
 
   const claimId = existingClaim?.id || `clm_${crypto.randomUUID().slice(0, 8)}`;
   const claimNumber = existingClaim?.claim_number || `CLM-${nextSequence('clm_seq', 99019)}`;
@@ -2752,19 +3439,19 @@ app.post('/api/staff/claims/adjudicate', requireAuth, requireRole('pharmacist', 
         plan.payerName,
         plan.bin,
         plan.pcn,
-        groupId?.trim() || `${plan.groupPrefix}100`,
+        groupId,
         tier,
         daw,
         supply,
-        Number(rx.unit_price_cents),
+        unitPriceCents,
         adjudication.allowedAmountCents,
         adjudication.insurerPaidCents,
         adjudication.deductibleAppliedCents,
         adjudication.patientCopayCents,
         adjudication.rejectionCode,
         adjudication.rejectionMessage,
-        (overrideCode || '').trim(),
-        (overrideNotes || '').trim(),
+        cleanOverrideCode,
+        cleanOverrideNotes,
         adjudication.claimStatus,
         now,
         claimId
@@ -2781,7 +3468,7 @@ app.post('/api/staff/claims/adjudicate', requireAuth, requireRole('pharmacist', 
       ).run(
         claimId,
         claimNumber,
-        prescriptionId,
+        cleanPrescriptionId,
         String(rx.rx_number),
         String(rx.patient_id),
         String(rx.patient_name),
@@ -2789,19 +3476,19 @@ app.post('/api/staff/claims/adjudicate', requireAuth, requireRole('pharmacist', 
         plan.payerName,
         plan.bin,
         plan.pcn,
-        groupId?.trim() || `${plan.groupPrefix}100`,
+        groupId,
         tier,
         daw,
         supply,
-        Number(rx.unit_price_cents),
+        unitPriceCents,
         adjudication.allowedAmountCents,
         adjudication.insurerPaidCents,
         adjudication.deductibleAppliedCents,
         adjudication.patientCopayCents,
         adjudication.rejectionCode,
         adjudication.rejectionMessage,
-        (overrideCode || '').trim(),
-        (overrideNotes || '').trim(),
+        cleanOverrideCode,
+        cleanOverrideNotes,
         adjudication.claimStatus,
         now
       );
@@ -2817,7 +3504,7 @@ app.post('/api/staff/claims/adjudicate', requireAuth, requireRole('pharmacist', 
     db.prepare('UPDATE prescriptions SET status = ?, updated_at = ? WHERE id = ?').run(
       nextRxStatus,
       now,
-      prescriptionId
+      cleanPrescriptionId
     );
 
     writeAuditLog(
@@ -2831,6 +3518,8 @@ app.post('/api/staff/claims/adjudicate', requireAuth, requireRole('pharmacist', 
         adjudication.insurerPaidCents / 100
       ).toFixed(2)} / Copay GH₵${(adjudication.patientCopayCents / 100).toFixed(2)}${
         adjudication.rejectionCode !== 'none' ? ` [NCPDP ${adjudication.rejectionCode}]` : ''
+      } · Tier ${tier} · DAW ${daw} · ${supply} days · Manual override: ${
+        cleanOverrideCode ? 'yes' : 'no'
       }`
     );
   });
@@ -2852,7 +3541,15 @@ app.post('/api/staff/replenishments/:id/receive', requireAuth, requireRole('phar
     return;
   }
 
-  const qtyToAdd = Number(po.confirmed_qty || po.requested_qty);
+  let qtyToAdd: number;
+  try {
+    qtyToAdd = validateConfirmedQuantity(po.confirmed_qty ?? po.requested_qty, po.requested_qty);
+  } catch (err) {
+    res.status(409).json({
+      error: err instanceof Error ? err.message : 'Purchase order quantity is invalid.',
+    });
+    return;
+  }
   const now = new Date().toISOString();
 
   runTx(() => {
@@ -2948,6 +3645,19 @@ app.patch('/api/supplier/orders/:id', requireAuth, requireRole('supplier', 'owne
     return;
   }
 
+  let safeConfirmedQty: number;
+  try {
+    safeConfirmedQty = validateConfirmedQuantity(
+      confirmedQty === undefined ? (po.confirmed_qty ?? po.requested_qty) : confirmedQty,
+      po.requested_qty
+    );
+  } catch (err) {
+    res.status(400).json({
+      error: err instanceof Error ? err.message : 'Confirmed quantity is invalid.',
+    });
+    return;
+  }
+
   const nextStatus = status === 'in_transit' ? 'in_transit' : 'confirmed_scheduled';
   const now = new Date().toISOString();
 
@@ -2955,7 +3665,7 @@ app.patch('/api/supplier/orders/:id', requireAuth, requireRole('supplier', 'owne
     db.prepare(
       `UPDATE replenishment_orders SET confirmed_qty = ?, batch_number = ?, batch_expiry = ?, scheduled_delivery_date = ?, delivery_window = ?, status = ?, updated_at = ? WHERE id = ?`
     ).run(
-      Number(confirmedQty || po.confirmed_qty || po.requested_qty),
+      safeConfirmedQty,
       (batchNumber || String(po.batch_number || `LOT-SUP-${nextSequence('lot_seq', 6000)}`)).trim(),
       (batchExpiry || String(po.batch_expiry || '2028-12-31')).trim(),
       (scheduledDeliveryDate || String(po.scheduled_delivery_date || new Date(Date.now() + 86400000).toISOString().slice(0, 10))).trim(),
@@ -3435,7 +4145,7 @@ async function startServer(): Promise<void> {
     const distPath = path.resolve(process.cwd(), 'dist');
     if (fs.existsSync(distPath)) {
       app.use(express.static(distPath));
-      app.get('*', (_req, res) => {
+      app.get('/*splat', (_req, res) => {
         res.sendFile(path.join(distPath, 'index.html'));
       });
     }

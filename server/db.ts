@@ -214,6 +214,8 @@ export function initializeDatabase(): void {
       tax_cents INTEGER NOT NULL,
       total_cents INTEGER NOT NULL,
       status TEXT NOT NULL,
+      payment_reference TEXT NOT NULL DEFAULT '',
+      payment_method TEXT NOT NULL DEFAULT 'pending',
       created_at TEXT NOT NULL
     );
 
@@ -254,6 +256,7 @@ export function initializeDatabase(): void {
       grand_total_cents INTEGER NOT NULL,
       tendered_cents INTEGER NOT NULL,
       change_due_cents INTEGER NOT NULL,
+      payment_reference TEXT NOT NULL DEFAULT '',
       created_at TEXT NOT NULL
     );
 
@@ -289,6 +292,22 @@ export function initializeDatabase(): void {
       receipt_number TEXT,
       hardware_transport TEXT NOT NULL,
       authorized_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS payment_references (
+      reference TEXT PRIMARY KEY,
+      amount_cents INTEGER NOT NULL,
+      created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS pos_payment_requests (
+      reference TEXT PRIMARY KEY,
+      grand_total_cents INTEGER NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending',
+      created_by TEXT NOT NULL,
+      created_by_name TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      resolved_at TEXT
     );
   `);
 
@@ -345,6 +364,23 @@ export function initializeDatabase(): void {
   if (!posColNames.has('service_total_cents')) {
     db.exec(`ALTER TABLE pos_transactions ADD COLUMN service_total_cents INTEGER NOT NULL DEFAULT 0;`);
   }
+  if (!posColNames.has('payment_reference')) {
+    db.exec(`ALTER TABLE pos_transactions ADD COLUMN payment_reference TEXT NOT NULL DEFAULT '';`);
+  }
+  db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS pos_transactions_payment_reference_unique
+    ON pos_transactions(payment_reference) WHERE payment_reference <> '';`);
+
+  // Idempotently add payment provenance to public OTC orders.
+  const otcCols = db.prepare(`PRAGMA table_info(otc_orders)`).all() as Array<{ name: string }>;
+  const otcColNames = new Set(otcCols.map((c) => c.name));
+  if (!otcColNames.has('payment_reference')) {
+    db.exec(`ALTER TABLE otc_orders ADD COLUMN payment_reference TEXT NOT NULL DEFAULT '';`);
+  }
+  if (!otcColNames.has('payment_method')) {
+    db.exec(`ALTER TABLE otc_orders ADD COLUMN payment_method TEXT NOT NULL DEFAULT 'pending';`);
+  }
+  db.exec(`CREATE UNIQUE INDEX IF NOT EXISTS otc_orders_payment_reference_unique
+    ON otc_orders(payment_reference) WHERE payment_reference <> '';`);
 
   // Idempotently add official manufacturer info columns to inventory on existing DBs
   const invCols = db.prepare(`PRAGMA table_info(inventory)`).all() as Array<{ name: string }>;
@@ -382,6 +418,36 @@ export function initializeDatabase(): void {
   seedSeq.run('lot_seq', 6000);
   seedSeq.run('nrx_seq', 99412055);
 
+  initializeSeedData();
+  seedInsurancePlans();
+  seedTestAccountsFromEnv();
+  enforceAppendOnlyLogs();
+}
+
+// Audit & financial logs are append-only: no application path may UPDATE or
+// DELETE them. Enforced at the SQLite level so even a compromised query path
+// cannot rewrite history. Runs last so one-time legacy data fixes above can
+// still execute on pre-trigger databases.
+function enforceAppendOnlyLogs(): void {
+  const appendOnlyTables = [
+    'audit_logs',
+    'cash_drawer_events',
+    'service_logs',
+    'payment_references',
+  ];
+  for (const table of appendOnlyTables) {
+    db.exec(`
+      CREATE TRIGGER IF NOT EXISTS ${table}_no_update
+      BEFORE UPDATE ON ${table}
+      BEGIN SELECT RAISE(ABORT, '${table} is append-only'); END;
+      CREATE TRIGGER IF NOT EXISTS ${table}_no_delete
+      BEFORE DELETE ON ${table}
+      BEGIN SELECT RAISE(ABORT, '${table} is append-only'); END;
+    `);
+  }
+}
+
+function initializeSeedData(): void {
   const existingUsers = db.prepare('SELECT COUNT(*) as count FROM users').get() as {
     count: number;
   };
@@ -1085,6 +1151,81 @@ export function initializeDatabase(): void {
     'Verified Ghana Data Protection Act 843, HIPAA & GDPR privacy consent and medication push alert consent.',
     now
   );
+}
+
+// Reference payer schemes required for claim adjudication. INSERT OR IGNORE so
+// owner edits via /api/owner/insurance-plans are never overwritten on boot.
+function seedInsurancePlans(): void {
+  const insertPlan = db.prepare(`
+    INSERT OR IGNORE INTO insurance_plans (id, payer_name, bin, pcn, group_prefix, tier1_copay_cents, tier2_copay_cents, tier3_copay_cents, reimbursement_rate)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `);
+  insertPlan.run('plan_bcbs', 'NHIS (National Health Insurance)', '233001', 'NHISGH', 'NHIS-', 500, 1500, 4500, 0.90);
+  insertPlan.run('plan_aetna', 'Acacia Health Insurance', '233002', 'ACACIA', 'ACA-', 1000, 3000, 6500, 0.88);
+  insertPlan.run('plan_uhc', 'Apex Health Insurance', '233003', 'APEXGH', 'APX-', 1200, 3500, 7500, 0.85);
+  insertPlan.run('plan_cigna', 'Glico Healthcare', '233004', 'GLICO', 'GLC-', 1000, 3200, 7000, 0.86);
+}
+
+interface TestAccountSpec {
+  envKey: string;
+  id: string;
+  role: 'patient' | 'pharmacist' | 'supplier' | 'owner';
+  fallbackName: string;
+}
+
+// Fixed IDs are referenced by staff tooling defaults and the catalog supplier link.
+const TEST_ACCOUNT_SPECS: TestAccountSpec[] = [
+  { envKey: 'TEST_PATIENT', id: 'usr_patient_maya', role: 'patient', fallbackName: 'Test Patient' },
+  { envKey: 'TEST_PHARMACIST', id: 'usr_pharm_elena', role: 'pharmacist', fallbackName: 'Test Pharmacist' },
+  { envKey: 'TEST_OWNER', id: 'usr_owner_david', role: 'owner', fallbackName: 'Test Owner' },
+  { envKey: 'TEST_SUPPLIER', id: 'usr_supplier_apex', role: 'supplier', fallbackName: 'Test Supplier' },
+];
+
+// Creates/updates portal accounts from TEST_<ROLE>_EMAIL / _PASSWORD / _NAME env vars.
+// Accounts are only provisioned for roles whose EMAIL and PASSWORD are both set;
+// env is the source of truth, so password rotations take effect on next boot.
+function seedTestAccountsFromEnv(): void {
+  const findById = db.prepare('SELECT id FROM users WHERE id = ?');
+  const findByEmail = db.prepare('SELECT id FROM users WHERE LOWER(email) = LOWER(?)');
+  const insertUser = db.prepare(`
+    INSERT INTO users (id, email, password_hash, display_name, role, consent_accepted_at, marketing_opt_in, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, 0, ?)
+  `);
+  const updateUser = db.prepare(`
+    UPDATE users SET email = ?, password_hash = ?, display_name = ?, role = ?,
+      consent_accepted_at = COALESCE(consent_accepted_at, ?)
+    WHERE id = ?
+  `);
+
+  for (const spec of TEST_ACCOUNT_SPECS) {
+    const email = process.env[`${spec.envKey}_EMAIL`]?.trim().toLowerCase();
+    const password = process.env[`${spec.envKey}_PASSWORD`];
+    if (!email || !password) continue;
+    if (password.length < 12) {
+      console.warn(`[netanya] ${spec.envKey}_PASSWORD must be at least 12 characters; account skipped.`);
+      continue;
+    }
+    const name = process.env[`${spec.envKey}_NAME`]?.trim() || spec.fallbackName;
+
+    const emailOwner = findByEmail.get(email) as { id: string } | undefined;
+    if (emailOwner && emailOwner.id !== spec.id) {
+      console.warn(`[netanya] ${spec.envKey}_EMAIL already belongs to ${emailOwner.id}; account skipped.`);
+      continue;
+    }
+
+    const now = new Date().toISOString();
+    if (findById.get(spec.id)) {
+      updateUser.run(email, hashPassword(password), name, spec.role, now, spec.id);
+    } else {
+      insertUser.run(spec.id, email, hashPassword(password), name, spec.role, now, now);
+    }
+  }
+
+  // Keep catalog supplier-of-record label in sync with the configured supplier account.
+  const supplierName = process.env.TEST_SUPPLIER_NAME?.trim();
+  if (supplierName && findById.get('usr_supplier_apex')) {
+    db.prepare(`UPDATE inventory SET supplier_name = ? WHERE supplier_id = 'usr_supplier_apex'`).run(supplierName);
+  }
 }
 
 function migrateAndPopulateCatalogAndServices(): void {

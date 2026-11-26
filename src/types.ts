@@ -60,6 +60,24 @@ export interface InventoryItem {
   requiresPrescription: boolean;
 }
 
+export interface PublicInventoryItem {
+  id: string;
+  ndcCode: string;
+  name: string;
+  category: InventoryCategory;
+  description: string;
+  imageUrl: string | null;
+  manufacturerName: string;
+  activeIngredient: string;
+  dosageForm: string;
+  usageDirections: string;
+  warnings: string;
+  storageInfo: string;
+  officialSourceUrl: string | null;
+  unitPriceCents: number;
+  inStock: boolean;
+}
+
 export interface OfficialDrugLookupResult {
   ndcCode: string;
   name: string;

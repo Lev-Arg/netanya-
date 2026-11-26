@@ -2,5 +2,5 @@
   "name": "NETANYA PHARMACY & RETAIL SHOP",
   "description": "HIPAA and GDPR compliant pharmacy and retail platform with automated stock tracking, supplier replenishment, full insurance claim builder, live pharmacist chat, and mobile refill push alerts.",
   "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+  "majorCapabilities": []
 }

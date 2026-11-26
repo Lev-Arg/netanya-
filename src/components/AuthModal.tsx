@@ -83,23 +83,15 @@ export const AuthModal: React.FC<AuthModalProps> = ({
       className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4 backdrop-blur-xs overflow-y-auto"
       role="dialog"
       aria-modal="true"
-      aria-labelledby="auth-modal-heading"
+      aria-label="Sign in or create an account"
     >
       <div className="my-8 w-full max-w-md rounded-xl border border-slate-200 bg-white p-6 shadow-xl">
-        <div className="flex items-center justify-between gap-4 border-b border-slate-200 pb-4">
-          <div className="flex items-center gap-3">
-            <NetanyaLogo size={40} />
-            <div>
-              <p className="text-xs font-semibold text-orange-600">NETANYA PHARMACY</p>
-              <h2 id="auth-modal-heading" className="text-lg font-bold text-slate-900">
-                {mode === 'login' ? 'Sign In' : 'Create Account'}
-              </h2>
-            </div>
-          </div>
+        <div className="relative flex items-center justify-center border-b border-slate-200 pb-4">
+          <NetanyaLogo size={40} />
           <button
             type="button"
             onClick={onClose}
-            className="flex h-9 w-9 items-center justify-center rounded-lg text-slate-500 hover:bg-slate-100"
+            className="absolute right-0 top-0 flex h-9 w-9 items-center justify-center rounded-lg text-slate-500 hover:bg-slate-100"
             aria-label="Close"
           >
             <X className="h-4 w-4" />

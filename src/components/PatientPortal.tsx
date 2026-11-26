@@ -343,15 +343,15 @@ export const PatientPortal: React.FC<PatientPortalProps> = ({
   ];
 
   return (
-    <div className="min-h-screen bg-slate-50 text-slate-900 pb-20 md:pb-0">
+    <div className="min-h-screen animate-fade-in bg-slate-50 text-slate-900 pb-20 md:pb-0">
       <div className="flex min-h-screen">
         {/* Desktop Sidebar */}
         <aside className="hidden w-64 shrink-0 flex-col justify-between border-r border-slate-200 bg-white p-5 md:flex">
           <div>
             <div className="flex items-center gap-2.5">
-              <NetanyaLogo size={36} />
+              <NetanyaLogo size={40} className="h-10 w-10" />
               <div className="min-w-0">
-                <p className="font-display text-xs font-bold text-slate-900 leading-tight">
+                <p className="font-display text-sm font-bold text-slate-900 leading-tight">
                   NETANYA PHARMACY
                 </p>
                 <p className="mt-0.5 truncate text-[11px] text-slate-500">

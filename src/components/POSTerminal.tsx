@@ -116,6 +116,11 @@ export const POSTerminal: React.FC<POSTerminalProps> = ({
   const [discountPercent, setDiscountPercent] = useState(0);
   const [paymentMethod, setPaymentMethod] = useState<'mobile_pay' | 'cash' | 'card'>('mobile_pay');
   const [cashTenderDollars, setCashTenderDollars] = useState('');
+  const [paymentReference, setPaymentReference] = useState('');
+  const [momoPhone, setMomoPhone] = useState('');
+  const [momoProvider, setMomoProvider] = useState<'mtn' | 'atl' | 'vod'>('mtn');
+  const [momoRequest, setMomoRequest] = useState<{ reference: string; status: string } | null>(null);
+  const [momoSending, setMomoSending] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [lastReceipt, setLastReceipt] = useState<PosReceipt | null>(null);
@@ -542,8 +547,79 @@ export const POSTerminal: React.FC<POSTerminalProps> = ({
     }
   };
 
+  const billPayload = () => ({
+    customerName,
+    customerEmail,
+    discountPercent,
+    otcItems: ticketOtc.map((l) => ({ inventoryId: l.item.id, quantity: l.quantity })),
+    prescriptionIds: ticketRxIds,
+    serviceItems: ticketServices.map((s) => ({
+      serviceId: s.service.id,
+      quantity: s.quantity,
+    })),
+  });
+
+  const handleSendMomoPrompt = async () => {
+    if (!hasBillLines || momoSending) return;
+    setMomoSending(true);
+    setError(null);
+    try {
+      const res = await apiFetch<{
+        reference: string;
+        status: string;
+        grandTotalCents: number;
+        displayText?: string | null;
+      }>('/api/staff/pos/payment-requests', {
+        method: 'POST',
+        body: JSON.stringify({
+          ...billPayload(),
+          customerPhone: momoPhone.trim(),
+          momoProvider,
+        }),
+      });
+      setMomoRequest({ reference: res.reference, status: res.status });
+      setPaymentReference(res.status === 'success' ? res.reference : '');
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Unable to send payment prompt.');
+    } finally {
+      setMomoSending(false);
+    }
+  };
+
+  // Poll the charge until the customer approves/expires (~180s network window).
+  useEffect(() => {
+    if (!momoRequest || (momoRequest.status !== 'pending' && momoRequest.status !== 'pay_offline' && momoRequest.status !== 'send_otp')) {
+      return;
+    }
+    const timer = window.setInterval(async () => {
+      try {
+        const res = await apiFetch<{ reference: string; status: string }>(
+          `/api/staff/pos/payment-requests/${encodeURIComponent(momoRequest.reference)}`
+        );
+        setMomoRequest({ reference: res.reference, status: res.status });
+        if (res.status === 'success') {
+          setPaymentReference(res.reference);
+        }
+      } catch {
+        // transient poll failure — keep waiting
+      }
+    }, 4000);
+    return () => window.clearInterval(timer);
+  }, [momoRequest]);
+
+  // Any bill change invalidates a collected electronic payment.
+  useEffect(() => {
+    setMomoRequest(null);
+    setPaymentReference('');
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ticketOtc, ticketServices, ticketRxIds, discountPercent]);
+
   const handleCheckout = async () => {
     if (!hasBillLines) return;
+    if (paymentMethod !== 'cash' && !paymentReference.trim()) {
+      setError('Complete the verified mobile money payment or enter a payment reference.');
+      return;
+    }
     if (paymentMethod === 'cash' && cashTenderDollars && tenderedCents < grandTotalCents) {
       setError('Cash received is less than the total due.');
       return;
@@ -562,18 +638,11 @@ export const POSTerminal: React.FC<POSTerminalProps> = ({
       }>('/api/staff/pos/checkout', {
         method: 'POST',
         body: JSON.stringify({
-          customerName,
-          customerEmail,
+          ...billPayload(),
           paymentMethod,
           tenderedCents,
-          discountPercent,
+          paymentReference: paymentMethod === 'cash' ? undefined : paymentReference.trim(),
           hardwareTransport: activeTransport,
-          otcItems: ticketOtc.map((l) => ({ inventoryId: l.item.id, quantity: l.quantity })),
-          prescriptionIds: ticketRxIds,
-          serviceItems: ticketServices.map((s) => ({
-            serviceId: s.service.id,
-            quantity: s.quantity,
-          })),
         }),
       });
       setLastReceipt(res.receipt);
@@ -582,6 +651,9 @@ export const POSTerminal: React.FC<POSTerminalProps> = ({
       setTicketRxIds([]);
       setDiscountPercent(0);
       setCashTenderDollars('');
+      setPaymentReference('');
+      setMomoPhone('');
+      setMomoRequest(null);
       setCustomerName('Walk-In Customer');
       setCustomerEmail('');
 
@@ -1418,6 +1490,78 @@ export const POSTerminal: React.FC<POSTerminalProps> = ({
                   <span>Change to Give</span>
                   <span className="font-mono tabular-nums">{formatMoney(changeDueCents)}</span>
                 </div>
+              </div>
+            )}
+
+            {paymentMethod === 'mobile_pay' && (
+              <div className="rounded-lg border border-slate-200 bg-slate-50 p-3 space-y-2">
+                <div className="grid grid-cols-[1fr_110px] gap-2">
+                  <input
+                    type="tel"
+                    value={momoPhone}
+                    onChange={(e) => setMomoPhone(e.target.value)}
+                    placeholder="Customer MoMo number (e.g. 024 123 4567)"
+                    autoComplete="off"
+                    className="rounded border border-slate-300 bg-white px-2.5 py-1.5 font-mono text-xs focus:border-orange-500 focus:outline-none"
+                  />
+                  <select
+                    value={momoProvider}
+                    onChange={(e) => setMomoProvider(e.target.value as 'mtn' | 'atl' | 'vod')}
+                    className="rounded border border-slate-300 bg-white px-2 py-1.5 text-xs font-semibold focus:border-orange-500 focus:outline-none"
+                  >
+                    <option value="mtn">MTN</option>
+                    <option value="vod">Telecel</option>
+                    <option value="atl">AirtelTigo</option>
+                  </select>
+                </div>
+                <button
+                  type="button"
+                  onClick={handleSendMomoPrompt}
+                  disabled={momoSending || !hasBillLines || Boolean(momoRequest && ['pending', 'pay_offline', 'send_otp'].includes(momoRequest.status))}
+                  className="w-full rounded-lg border border-orange-600 bg-white py-2 text-xs font-semibold text-orange-700 hover:bg-orange-50 disabled:opacity-45 transition-colors"
+                >
+                  {momoSending
+                    ? 'Sending prompt...'
+                    : momoRequest && ['pending', 'pay_offline', 'send_otp'].includes(momoRequest.status)
+                      ? 'Waiting for customer approval...'
+                      : `Send MoMo Prompt (${formatMoney(grandTotalCents)})`}
+                </button>
+                {momoRequest && (
+                  <p
+                    className={`text-[11px] font-semibold ${
+                      momoRequest.status === 'success'
+                        ? 'text-emerald-700'
+                        : ['failed', 'expired', 'superseded', 'abandoned'].includes(momoRequest.status)
+                          ? 'text-red-600'
+                          : 'text-slate-500'
+                    }`}
+                  >
+                    {momoRequest.status === 'success'
+                      ? `Payment confirmed — reference ${momoRequest.reference}`
+                      : ['failed', 'expired', 'superseded', 'abandoned'].includes(momoRequest.status)
+                        ? `Payment ${momoRequest.status} — send a new prompt to retry.`
+                        : 'Prompt sent — customer must approve on their phone within ~3 minutes.'}
+                  </p>
+                )}
+              </div>
+            )}
+
+            {paymentMethod === 'card' && (
+              <div className="rounded-lg border border-slate-200 bg-slate-50 p-3 space-y-1.5">
+                <label className="text-xs font-semibold text-slate-700">
+                  Paystack Payment Reference
+                </label>
+                <input
+                  type="text"
+                  value={paymentReference}
+                  onChange={(e) => setPaymentReference(e.target.value)}
+                  placeholder="e.g. 7b8f9c2d-…"
+                  autoComplete="off"
+                  className="w-full rounded border border-slate-300 bg-white px-2.5 py-1.5 font-mono text-xs focus:border-orange-500 focus:outline-none"
+                />
+                <p className="text-[11px] text-slate-500">
+                  Verified server-side — the paid amount must equal {formatMoney(grandTotalCents)}.
+                </p>
               </div>
             )}
 

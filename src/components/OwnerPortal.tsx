@@ -237,13 +237,13 @@ export const OwnerPortal: React.FC<OwnerPortalProps> = ({
     : 10000;
 
   return (
-    <div className="min-h-screen bg-slate-50 text-slate-900">
+    <div className="min-h-screen animate-fade-in bg-slate-50 text-slate-900">
       <header className="sticky top-0 z-30 border-b border-slate-200 bg-white">
         <div className="mx-auto flex h-16 max-w-7xl items-center justify-between gap-4 px-4 sm:px-6 lg:px-8">
-          <div className="flex items-center gap-3 min-w-0">
-            <NetanyaLogo size={38} />
+          <div className="flex items-center gap-2.5 min-w-0">
+            <NetanyaLogo size={40} className="h-10 w-10" />
             <div className="min-w-0">
-              <span className="block truncate font-display text-sm font-bold text-slate-900">
+              <span className="block truncate font-display text-base font-bold text-slate-900">
                 NETANYA PHARMACY
               </span>
               <span className="block truncate text-[11px] text-slate-500">

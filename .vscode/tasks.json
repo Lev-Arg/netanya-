@@ -1,0 +1,20 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Start Netanya Pharmacy dev server",
+			"type": "shell",
+			"command": "wsl.exe",
+			"args": [
+				"-d",
+				"kali-linux",
+				"--",
+				"bash",
+				"-lc",
+				"cd /home/argila/netanyaPH && ./node_modules/.bin/tsx server.ts"
+			],
+			"isBackground": true,
+			"problemMatcher": []
+		}
+	]
+}

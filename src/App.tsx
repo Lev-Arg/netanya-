@@ -6,7 +6,7 @@ import { OfflineIndicator } from './components/PWAControls.tsx';
 import { PublicStorefront } from './components/PublicStorefront.tsx';
 import { StaffPortal } from './components/StaffPortal.tsx';
 import { SupplierPortal } from './components/SupplierPortal.tsx';
-import type { AuthUser, InventoryItem, PharmacyService } from './types.ts';
+import type { AuthUser, PharmacyService, PublicInventoryItem } from './types.ts';
 import { apiFetch, getStoredToken, setStoredToken, useRealtimeTopics } from './utils/api.ts';
 
 export default function App() {
@@ -15,7 +15,7 @@ export default function App() {
   const [viewMode, setViewMode] = useState<'public' | 'portal'>('public');
   const [authModalOpen, setAuthModalOpen] = useState(false);
 
-  const [catalogItems, setCatalogItems] = useState<InventoryItem[]>([]);
+  const [catalogItems, setCatalogItems] = useState<PublicInventoryItem[]>([]);
   const [services, setServices] = useState<PharmacyService[]>([]);
   const [acceptedPlans, setAcceptedPlans] = useState<
     Array<{ id: string; payerName: string; bin: string; pcn: string; groupPrefix: string }>
@@ -25,7 +25,7 @@ export default function App() {
   const loadCatalog = useCallback(async () => {
     try {
       const data = await apiFetch<{
-        items: InventoryItem[];
+        items: PublicInventoryItem[];
         services?: PharmacyService[];
         acceptedPlans: Array<{
           id: string;

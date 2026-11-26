@@ -151,13 +151,8 @@ export const StaffPortal: React.FC<StaffPortalProps> = ({
   // Insurance Claim Form
   const [selectedRxId, setSelectedRxId] = useState<string>('rx_1003');
   const [selectedPlanId, setSelectedPlanId] = useState<string>('plan_bcbs');
-  const [claimBin, setClaimBin] = useState('233001');
-  const [claimPcn, setClaimPcn] = useState('NHISGH');
-  const [claimGroup, setClaimGroup] = useState('NHIS-100');
   const [formularyTier, setFormularyTier] = useState<1 | 2 | 3>(1);
   const [dawCode, setDawCode] = useState<'0' | '1' | '2'>('0');
-  const [daysSupply, setDaysSupply] = useState(30);
-  const [deductibleDollars, setDeductibleDollars] = useState('0');
   const [overrideCode, setOverrideCode] = useState('');
   const [overrideNotes, setOverrideNotes] = useState('');
   const [claimBusy, setClaimBusy] = useState(false);
@@ -262,11 +257,7 @@ export const StaffPortal: React.FC<StaffPortalProps> = ({
       if (data.insurancePlans.length > 0) {
         setSelectedPlanId((prev) => {
           if (data.insurancePlans.some((p) => p.id === prev)) return prev;
-          const first = data.insurancePlans[0];
-          setClaimBin(first.bin);
-          setClaimPcn(first.pcn);
-          setClaimGroup(`${first.groupPrefix}100`);
-          return first.id;
+          return data.insurancePlans[0].id;
         });
       }
       if (data.patients.length > 0) {
@@ -336,11 +327,8 @@ export const StaffPortal: React.FC<StaffPortalProps> = ({
     [claims, selectedRx]
   );
 
-  // Sync claim fields when selecting an existing Rx with a claim or daysSupply
+  // Sync pharmacist adjudication inputs when selecting an existing Rx with a claim.
   useEffect(() => {
-    if (selectedRx) {
-      setDaysSupply(selectedRx.daysSupply);
-    }
     if (existingClaimForRx) {
       setFormularyTier(existingClaimForRx.formularyTier);
       setDawCode(existingClaimForRx.dawCode);
@@ -348,6 +336,17 @@ export const StaffPortal: React.FC<StaffPortalProps> = ({
       setOverrideNotes(existingClaimForRx.overrideNotes);
     }
   }, [selectedRx?.id, existingClaimForRx]);
+
+  useEffect(() => {
+    if (!selectedRx) return;
+    const patient = patients.find((p) => p.id === selectedRx.patientId);
+    const bin = patient?.phi?.bin.trim();
+    const pcn = patient?.phi?.pcn.trim();
+    if (!bin || !pcn) return;
+
+    const matchingPlan = insurancePlans.find((plan) => plan.bin.trim() === bin && plan.pcn.trim() === pcn);
+    if (matchingPlan) setSelectedPlanId(matchingPlan.id);
+  }, [selectedRx?.id, selectedRx?.patientId, patients, insurancePlans]);
 
   const filteredPrescriptions = useMemo(() => {
     const q = rxSearch.trim().toLowerCase();
@@ -410,12 +409,6 @@ export const StaffPortal: React.FC<StaffPortalProps> = ({
 
   const handlePlanChange = (planId: string) => {
     setSelectedPlanId(planId);
-    const plan = insurancePlans.find((p) => p.id === planId);
-    if (plan) {
-      setClaimBin(plan.bin);
-      setClaimPcn(plan.pcn);
-      setClaimGroup(`${plan.groupPrefix}100`);
-    }
   };
 
   const handleCreatePrescription = async (e: React.FormEvent) => {
@@ -569,13 +562,8 @@ export const StaffPortal: React.FC<StaffPortalProps> = ({
         body: JSON.stringify({
           prescriptionId: selectedRx.id,
           planId: selectedPlan.id,
-          bin: claimBin,
-          pcn: claimPcn,
-          groupId: claimGroup,
           formularyTier,
           dawCode,
-          daysSupply,
-          deductibleRemainingCents: Math.round((Number(deductibleDollars) || 0) * 100),
           overrideCode,
           overrideNotes,
         }),
@@ -856,21 +844,22 @@ export const StaffPortal: React.FC<StaffPortalProps> = ({
     const uc = selectedRx.unitPriceCents;
     const dawMod = dawCode === '1' ? 0.94 : 1.0;
     const allowed = Math.max(500, Math.round(uc * selectedPlan.reimbursementRate * dawMod));
-    const supplyMult = daysSupply >= 60 ? 2 : 1;
+    const supplyMult = selectedRx.daysSupply >= 60 ? 2 : 1;
     const tierBase =
       formularyTier === 1
         ? selectedPlan.tier1CopayCents
         : formularyTier === 2
           ? selectedPlan.tier2CopayCents
           : selectedPlan.tier3CopayCents;
-    const dedCents = Math.min(allowed, Math.max(0, Math.round((Number(deductibleDollars) || 0) * 100)));
+    const dedCents = 0;
     const rem = Math.max(0, allowed - dedCents);
     const copay = dedCents + Math.min(rem, tierBase * supplyMult + (dawCode === '2' ? 1500 : 0));
     const insurer = Math.max(0, allowed - copay);
     return { uc, allowed, dedCents, copay, insurer };
-  }, [selectedRx, selectedPlan, dawCode, daysSupply, formularyTier, deductibleDollars]);
+  }, [selectedRx, selectedPlan, dawCode, formularyTier]);
 
   const claimRuleHint = useMemo(() => {
+    const daysSupply = selectedRx?.daysSupply ?? 0;
     const code = overrideCode.trim().toUpperCase();
     if (
       dawCode === '2' &&
@@ -887,7 +876,7 @@ export const StaffPortal: React.FC<StaffPortalProps> = ({
       return 'Packs over 90 days require pharmacist review code M0-1B.';
     }
     return null;
-  }, [formularyTier, dawCode, daysSupply, selectedPlan, overrideCode]);
+  }, [formularyTier, dawCode, selectedRx, selectedPlan, overrideCode]);
 
   const navItems: Array<{
     id: StaffTab;
@@ -1604,33 +1593,30 @@ export const StaffPortal: React.FC<StaffPortalProps> = ({
               </div>
             </div>
 
+            <p className="rounded-lg border border-blue-200 bg-blue-50 px-3 py-2 text-xs leading-relaxed text-blue-900">
+              This is a local estimate, not a response from an insurer. Scheme identifiers and
+              prescription days supply are read from server records. Deductible data is not
+              configured, so the estimate excludes a deductible.
+            </p>
+
             <div className="grid grid-cols-3 gap-3">
               <div>
                 <label className="block text-xs font-semibold text-slate-700">Scheme BIN</label>
-                <input
-                  type="text"
-                  value={claimBin}
-                  onChange={(e) => setClaimBin(e.target.value)}
-                  className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 font-mono text-xs tabular-nums focus:border-orange-500 focus:outline-none"
-                />
+                <p className="mt-1 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 font-mono text-xs">
+                  {selectedPlan?.bin || 'Select a scheme'}
+                </p>
               </div>
               <div>
                 <label className="block text-xs font-semibold text-slate-700">Code / PCN</label>
-                <input
-                  type="text"
-                  value={claimPcn}
-                  onChange={(e) => setClaimPcn(e.target.value)}
-                  className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 font-mono text-xs focus:border-orange-500 focus:outline-none"
-                />
+                <p className="mt-1 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 font-mono text-xs">
+                  {selectedPlan?.pcn || 'Select a scheme'}
+                </p>
               </div>
               <div>
-                <label className="block text-xs font-semibold text-slate-700">Group / Card ID</label>
-                <input
-                  type="text"
-                  value={claimGroup}
-                  onChange={(e) => setClaimGroup(e.target.value)}
-                  className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 font-mono text-xs focus:border-orange-500 focus:outline-none"
-                />
+                <label className="block text-xs font-semibold text-slate-700">Group Prefix</label>
+                <p className="mt-1 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 font-mono text-xs">
+                  {selectedPlan?.groupPrefix || 'Select a scheme'}
+                </p>
               </div>
             </div>
 
@@ -1660,28 +1646,20 @@ export const StaffPortal: React.FC<StaffPortalProps> = ({
                 </select>
               </div>
               <div>
-                <label className="block text-xs font-semibold text-slate-700">Days Supply</label>
-                <input
-                  type="number"
-                  min={1}
-                  max={180}
-                  value={daysSupply}
-                  onChange={(e) => setDaysSupply(Number(e.target.value) || 30)}
-                  className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 font-mono text-xs tabular-nums focus:border-orange-500 focus:outline-none"
-                />
+                <label className="block text-xs font-semibold text-slate-700">
+                  Prescription Days Supply
+                </label>
+                <p className="mt-1 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 font-mono text-xs tabular-nums">
+                  {selectedRx?.daysSupply ?? 'Select a prescription'}
+                </p>
               </div>
               <div>
                 <label className="block text-xs font-semibold text-slate-700">
                   Deductible (GH₵)
                 </label>
-                <input
-                  type="number"
-                  min={0}
-                  step="0.01"
-                  value={deductibleDollars}
-                  onChange={(e) => setDeductibleDollars(e.target.value)}
-                  className="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 font-mono text-xs tabular-nums focus:border-orange-500 focus:outline-none"
-                />
+                <p className="mt-1 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 font-mono text-xs tabular-nums">
+                  Not configured
+                </p>
               </div>
             </div>
 
@@ -3160,15 +3138,15 @@ export const StaffPortal: React.FC<StaffPortalProps> = ({
   }
 
   return (
-    <div className="min-h-screen bg-slate-50 text-slate-900 pb-20 md:pb-0">
+    <div className="min-h-screen animate-fade-in bg-slate-50 text-slate-900 pb-20 md:pb-0">
       <div className="flex min-h-screen">
         {/* Clean Fixed Left Sidebar (240px) */}
         <aside className="hidden w-60 shrink-0 flex-col justify-between border-r border-slate-200 bg-white p-4 md:flex">
           <div>
             <div className="flex items-center gap-2.5 px-1">
-              <NetanyaLogo size={36} />
+              <NetanyaLogo size={40} className="h-10 w-10" />
               <div className="min-w-0">
-                <p className="font-display text-xs font-bold text-slate-900 leading-tight">
+                <p className="font-display text-sm font-bold text-slate-900 leading-tight">
                   NETANYA PHARMACY
                 </p>
                 <p className="mt-0.5 truncate text-[11px] text-slate-500">{user.displayName}</p>
